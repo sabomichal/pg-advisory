@@ -18,7 +18,7 @@ final class SingleConnectionFactory {
 
     /** @param initializer runs once on the new connection */
     SingleConnectionFactory(ConnectionFactory target, Function<Connection, Mono<Void>> initializer) {
-        this.connection = Mono.from(target.create())
+        this.connection = Mono.<Connection>from(target.create())
                 .doOnNext(created::set)
                 .flatMap(newConnection -> initializer.apply(newConnection).thenReturn(newConnection))
                 .cache();
