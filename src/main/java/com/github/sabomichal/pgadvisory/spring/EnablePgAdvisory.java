@@ -9,8 +9,8 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * Enables {@code PgAdvisory} without Spring Boot. Settings come from a {@code PgAdvisorySettings} bean
- * (defaults otherwise). Register a {@link FencingR2dbcTransactionManager} to fence transactions.
+ * Enables the {@code LockManager} without Spring Boot. Needs a {@link PgAdvisoryLockConnectionFactory} bean;
+ * settings come from a {@code LockManagerSettings} bean (defaults otherwise).
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)

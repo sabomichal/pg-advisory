@@ -74,10 +74,10 @@ public final class TestPostgres {
         return Flux.from(statement.execute()).concatMap(result -> result.map(_ -> 1L)).count();
     }
 
-    /** Kills the lock session of {@code owner} and waits until it is gone; PostgreSQL releases all its advisory locks. */
-    public static long terminateLockSession(String owner) {
+    /** Kills the connections named {@code applicationName} and waits until they are gone; PostgreSQL releases their advisory locks. */
+    public static long terminateConnections(String applicationName) {
         return await(withConnection(connection -> execute(connection,
                 "SELECT pg_terminate_backend(pid, 10000) FROM pg_stat_activity WHERE application_name = $1",
-                "pg-advisory:" + owner)));
+                applicationName)));
     }
 }
