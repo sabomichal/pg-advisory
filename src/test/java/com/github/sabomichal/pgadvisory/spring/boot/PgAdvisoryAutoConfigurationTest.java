@@ -44,13 +44,12 @@ class PgAdvisoryAutoConfigurationTest {
 
     @Test
     void createsTheLockManagerWithoutBeingEnabled() {
-        runner.withPropertyValues("pg-advisory.schema.auto-create=true")
-                .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    var key = UUID.randomUUID().toString();
+        runner.run(context -> {
+            assertThat(context).hasNotFailed();
+            var key = UUID.randomUUID().toString();
 
-                    assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(key);
-                });
+            assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(key);
+        });
     }
 
     @Test
@@ -78,7 +77,6 @@ class PgAdvisoryAutoConfigurationTest {
         new ApplicationContextRunner()
                 .withConfiguration(AutoConfigurations.of(PgAdvisoryAutoConfiguration.class))
                 .withBean(PgAdvisoryLockConnectionFactory.class, () -> new PgAdvisoryLockConnectionFactory(TestPostgres.connectionFactory()))
-                .withPropertyValues("pg-advisory.schema.auto-create=true")
                 .run(context -> {
                     var key = UUID.randomUUID().toString();
 
@@ -88,9 +86,7 @@ class PgAdvisoryAutoConfigurationTest {
 
     @Test
     void propertyDefaultsMatchSettingsDefaults() {
-        runner.withPropertyValues("pg-advisory.schema.auto-create=true")
-                .run(context -> assertThat(context.getBean(LockManagerSettings.class))
-                        .isEqualTo(LockManagerSettings.builder().autoCreateSchema(true).build()));
+        runner.run(context -> assertThat(context.getBean(LockManagerSettings.class)).isEqualTo(LockManagerSettings.defaults()));
     }
 
     @Test
@@ -102,11 +98,9 @@ class PgAdvisoryAutoConfigurationTest {
                 .withConfiguration(AutoConfigurations.of(R2dbcAutoConfiguration.class, PgAdvisoryAutoConfiguration.class))
                 .withBean(ConnectionFactoryOptionsBuilderCustomizer.class,
                         () -> options -> options.option(Option.<String>valueOf("schema"), schema))
-                .withPropertyValues(
-                        "spring.r2dbc.url=" + TestPostgres.url("r2dbc:pool:postgresql"),
-                        "spring.r2dbc.username=" + TestPostgres.username(),
-                        "spring.r2dbc.password=" + TestPostgres.password(),
-                        "pg-advisory.schema.auto-create=true")
+                .withPropertyValues(TestPostgres.r2dbcProperties())
+                // the lock table does not exist in the new schema yet
+                .withPropertyValues("pg-advisory.schema.auto-create=true")
                 .run(context -> {
                     var key = UUID.randomUUID().toString();
 
@@ -160,7 +154,7 @@ class PgAdvisoryAutoConfigurationTest {
 
         @Bean
         LockManagerSettings lockManagerSettings() {
-            return LockManagerSettings.builder().applicationName("enable").autoCreateSchema(true).build();
+            return LockManagerSettings.builder().applicationName("enable").build();
         }
     }
 
