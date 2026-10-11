@@ -3,6 +3,7 @@ package com.github.sabomichal.pgadvisory.spring.boot;
 import com.github.sabomichal.pgadvisory.LockManager;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
 import com.github.sabomichal.pgadvisory.TestPostgres;
+import com.github.sabomichal.pgadvisory.r2dbc.R2dbcLockManager;
 import com.github.sabomichal.pgadvisory.spring.EnablePgAdvisory;
 import com.github.sabomichal.pgadvisory.spring.PgAdvisoryLockConnectionFactory;
 import io.r2dbc.spi.ConnectionFactory;
@@ -12,7 +13,6 @@ import org.springframework.beans.factory.BeanCreationException;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.context.annotation.ImportCandidates;
-import org.springframework.boot.health.contributor.Status;
 import org.springframework.boot.r2dbc.autoconfigure.ConnectionFactoryOptionsBuilderCustomizer;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcAutoConfiguration;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcConnectionDetails;
@@ -43,28 +43,52 @@ class PgAdvisoryAutoConfigurationTest {
     }
 
     @Test
-    void nothingIsConfiguredWithoutPgAdvisoryEnabled() {
-        runner.run(context -> assertThat(context).doesNotHaveBean(LockManager.class));
+    void createsTheLockManagerWithoutBeingEnabled() {
+        runner.withPropertyValues("pg-advisory.schema.auto-create=true")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    var key = UUID.randomUUID().toString();
+
+                    assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(key);
+                });
     }
 
     @Test
-    void createsTheLockManagerAndItsHealthIndicator() {
-        runner.withPropertyValues("spring.pg-advisory.enabled=true", "spring.pg-advisory.schema.auto-create=true")
+    void canBeSwitchedOff() {
+        runner.withPropertyValues("pg-advisory.enabled=false")
+                .run(context -> assertThat(context).hasNotFailed().doesNotHaveBean(LockManager.class));
+    }
+
+    @Test
+    void backsOffWhenThereIsNothingToConnectTheLockManagerWith() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(PgAdvisoryAutoConfiguration.class))
+                .run(context -> assertThat(context).hasNotFailed().doesNotHaveBean(LockManager.class));
+    }
+
+    @Test
+    void backsOffForTheApplicationsOwnLockManager() {
+        runner.withBean("ownLockManager", LockManager.class,
+                        () -> new R2dbcLockManager(TestPostgres.connectionFactory(), LockManagerSettings.defaults()))
+                .run(context -> assertThat(context).hasNotFailed().hasSingleBean(LockManager.class).hasBean("ownLockManager"));
+    }
+
+    @Test
+    void usesTheApplicationsOwnLockConnectionFactory() {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(PgAdvisoryAutoConfiguration.class))
+                .withBean(PgAdvisoryLockConnectionFactory.class, () -> new PgAdvisoryLockConnectionFactory(TestPostgres.connectionFactory()))
+                .withPropertyValues("pg-advisory.schema.auto-create=true")
                 .run(context -> {
-                    assertThat(context).hasNotFailed();
-                    var lockManager = context.getBean(LockManager.class);
                     var key = UUID.randomUUID().toString();
 
-                    assertThat(lockAndUnlock(lockManager, key)).isEqualTo(key);
-                    var health = context.getBean(PgAdvisoryHealthIndicator.class).health().block();
-                    assertThat(health).isNotNull();
-                    assertThat(health.getStatus()).isEqualTo(Status.UP);
+                    assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(key);
                 });
     }
 
     @Test
     void propertyDefaultsMatchSettingsDefaults() {
-        runner.withPropertyValues("spring.pg-advisory.enabled=true", "spring.pg-advisory.schema.auto-create=true")
+        runner.withPropertyValues("pg-advisory.schema.auto-create=true")
                 .run(context -> assertThat(context.getBean(LockManagerSettings.class))
                         .isEqualTo(LockManagerSettings.builder().autoCreateSchema(true).build()));
     }
@@ -82,8 +106,7 @@ class PgAdvisoryAutoConfigurationTest {
                         "spring.r2dbc.url=" + TestPostgres.url("r2dbc:pool:postgresql"),
                         "spring.r2dbc.username=" + TestPostgres.username(),
                         "spring.r2dbc.password=" + TestPostgres.password(),
-                        "spring.pg-advisory.enabled=true",
-                        "spring.pg-advisory.schema.auto-create=true")
+                        "pg-advisory.schema.auto-create=true")
                 .run(context -> {
                     var key = UUID.randomUUID().toString();
 
@@ -92,14 +115,6 @@ class PgAdvisoryAutoConfigurationTest {
                             "SELECT 1 WHERE to_regclass($1) IS NOT NULL", schema + ".advisory_lock"));
                     assertThat(await(lockTables)).isEqualTo(1L);
                 });
-    }
-
-    @Test
-    void failsWithoutConnectionDetailsOfTheLockConnection() {
-        new ApplicationContextRunner()
-                .withConfiguration(AutoConfigurations.of(PgAdvisoryAutoConfiguration.class))
-                .withPropertyValues("spring.pg-advisory.enabled=true")
-                .run(context -> assertThat(context).getFailure().rootCause().hasMessageContaining("spring.pg-advisory.r2dbc.url"));
     }
 
     @Test

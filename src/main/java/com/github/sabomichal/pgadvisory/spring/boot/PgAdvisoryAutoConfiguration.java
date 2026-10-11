@@ -9,23 +9,32 @@ import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.ConnectionFactoryOptions;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.AnyNestedCondition;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.boot.health.contributor.ReactiveHealthIndicator;
 import org.springframework.boot.r2dbc.autoconfigure.ConnectionFactoryOptionsBuilderCustomizer;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcAutoConfiguration;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcConnectionDetails;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Import;
 
-/** Active with {@code spring.pg-advisory.enabled=true}. */
+/**
+ * Creates the {@link LockManager} when there is something to connect it with: {@code pg-advisory.r2dbc.url}, the
+ * application's R2DBC connection details, or a {@link PgAdvisoryLockConnectionFactory} bean. Backs off when the
+ * application defines its own {@code LockManager} or sets {@code pg-advisory.enabled=false}.
+ */
 @AutoConfiguration(after = R2dbcAutoConfiguration.class)
-@ConditionalOnClass(ConnectionFactory.class)
-@ConditionalOnBooleanProperty("spring.pg-advisory.enabled")
+@ConditionalOnClass({ConnectionFactory.class, R2dbcConnectionDetails.class})
+@ConditionalOnBooleanProperty(name = "pg-advisory.enabled", matchIfMissing = true)
+@ConditionalOnMissingBean(LockManager.class)
+@Conditional(PgAdvisoryAutoConfiguration.LockConnectionAvailable.class)
 @EnableConfigurationProperties(PgAdvisoryProperties.class)
+@Import(PgAdvisoryConfiguration.class)
 public class PgAdvisoryAutoConfiguration {
 
     @Bean
@@ -36,9 +45,9 @@ public class PgAdvisoryAutoConfiguration {
 
     /**
      * The lock manager always gets a connection factory of its own, never the application's pool: from
-     * {@code spring.pg-advisory.r2dbc.*} when set, otherwise from the application's connection details. Either
-     * way the application's {@link ConnectionFactoryOptionsBuilderCustomizer}s apply, like they do to the
-     * application's factory, so that the lock connection sees the same database and schema.
+     * {@code pg-advisory.r2dbc.*} when set, otherwise from the application's connection details. Either way the
+     * application's {@link ConnectionFactoryOptionsBuilderCustomizer}s apply, like they do to the application's
+     * factory, so that the lock connection sees the same database and schema.
      */
     @Bean
     @ConditionalOnMissingBean
@@ -57,12 +66,7 @@ public class PgAdvisoryAutoConfiguration {
             }
             options = builder.build();
         } else {
-            var details = connectionDetails.getIfAvailable();
-            if (details == null) {
-                throw new IllegalStateException("Cannot create the connection factory of the lock manager: "
-                        + "set spring.pg-advisory.r2dbc.url or define a PgAdvisoryLockConnectionFactory bean");
-            }
-            options = details.getConnectionFactoryOptions();
+            options = connectionDetails.getObject().getConnectionFactoryOptions();
         }
         var customized = options.mutate();
         customizers.orderedStream().forEach(customizer -> customizer.customize(customized));
@@ -82,20 +86,23 @@ public class PgAdvisoryAutoConfiguration {
                 .build();
     }
 
-    @Configuration(proxyBeanMethods = false)
-    @ConditionalOnMissingBean(LockManager.class)
-    @Import(PgAdvisoryConfiguration.class)
-    static class PgAdvisoryCoreConfiguration {
-    }
+    /** There is something to create the lock connection from. */
+    static class LockConnectionAvailable extends AnyNestedCondition {
 
-    @Configuration(proxyBeanMethods = false)
-    @ConditionalOnClass(ReactiveHealthIndicator.class)
-    static class PgAdvisoryHealthConfiguration {
+        LockConnectionAvailable() {
+            super(ConfigurationPhase.REGISTER_BEAN);
+        }
 
-        @Bean
-        @ConditionalOnMissingBean(name = "pgAdvisoryHealthIndicator")
-        PgAdvisoryHealthIndicator pgAdvisoryHealthIndicator(LockManager lockManager) {
-            return new PgAdvisoryHealthIndicator(lockManager);
+        @ConditionalOnProperty("pg-advisory.r2dbc.url")
+        static class OwnUrl {
+        }
+
+        @ConditionalOnBean(R2dbcConnectionDetails.class)
+        static class ApplicationConnectionDetails {
+        }
+
+        @ConditionalOnBean(PgAdvisoryLockConnectionFactory.class)
+        static class OwnConnectionFactory {
         }
     }
 }
