@@ -5,7 +5,6 @@ import com.github.sabomichal.pgadvisory.LockManagerSettings;
 import com.github.sabomichal.pgadvisory.LockOperationException;
 import com.github.sabomichal.pgadvisory.TestPostgres;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import reactor.core.publisher.Flux;
@@ -29,11 +28,6 @@ import static org.awaitility.Awaitility.await;
 class R2dbcLockManagerTest {
 
     private final List<R2dbcLockManager> lockManagers = new ArrayList<>();
-
-    @BeforeAll
-    void createLockTable() {
-        await(lockManager(settings("setup").autoCreateSchema(true)).ensureTable());
-    }
 
     @AfterEach
     void closeLockManagers() {
