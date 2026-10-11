@@ -58,7 +58,7 @@ completion even if its caller cancels (see step 1). The `retry.*` settings go aw
 ## 5. A lost lock connection goes unnoticed
 
 **Problem.** Only `validateDbConnection` detects a broken lock connection, called after a
-non-transient R2DBC error or by the health indicator. Until then the instance believes it holds its
+non-transient R2DBC error or by the application. Until then the instance believes it holds its
 locks while PostgreSQL has released them. An idle lock connection may even be closed by the server
 (`idle_session_timeout`). After a reset the in-memory entries are cleared while old work still runs,
 so the same instance can lock a key again next to it, and the old work's unlock hits the new
@@ -134,7 +134,10 @@ original code the lock record held an RPC endpoint for routing requests to the h
 ## 11. Observability
 
 `AdvisoryLockListener` callbacks (acquired, failed, released, lost, connection lost/restored), Spring
-application events (sealed `PgAdvisoryEvents`) and Micrometer metrics (`pg.advisory.*`).
+application events (sealed `PgAdvisoryEvents`), Micrometer metrics (`pg.advisory.*`) and a health
+indicator that reports the state of the lock connection from the heartbeat (step 5), without side
+effects. A health indicator on `validateDbConnection` would re-create the connection and stop running
+work on every probe, and compete with locking for the lock connection.
 
 ## 12. Locking abandoned keys in bulk
 

@@ -32,7 +32,7 @@ classpath.
 
 One row per key; its `id` is the advisory lock id. Create it with your migrations from
 `classpath:db/pg-advisory/V1__advisory_lock.sql`, or let the library create it
-(`spring.pg-advisory.schema.auto-create=true`, `LockManagerSettings.autoCreateSchema`).
+(`pg-advisory.schema.auto-create=true`, `LockManagerSettings.autoCreateSchema`).
 
 ```sql
 CREATE TABLE IF NOT EXISTS advisory_lock
@@ -44,17 +44,16 @@ CREATE TABLE IF NOT EXISTS advisory_lock
 
 ### Spring Boot
 
-```yaml
-spring:
-  pg-advisory:
-    enabled: true
-```
-
-This registers a `LockManager` bean and a health indicator `pgAdvisory`. The lock connection is a
-connection of its own, never one from the application's pool: from `spring.pg-advisory.r2dbc.url`
-when it is set, otherwise with the application's connection details (`spring.r2dbc.*`, Testcontainers
-or Docker Compose service connections). Either way the application's
+Adding the dependency is enough: the auto-configuration registers a `LockManager` bean as soon as
+there is something to connect it with. The lock connection is a connection of its own, never one from
+the application's pool: from `pg-advisory.r2dbc.url` when it is set, otherwise with the
+application's connection details (`spring.r2dbc.*`, Testcontainers or Docker Compose service
+connections), or from your own `PgAdvisoryLockConnectionFactory` bean. Either way the application's
 `ConnectionFactoryOptionsBuilderCustomizer` beans apply, so that it sees the same database and schema.
+
+On start the lock manager verifies the lock table and fails when it is missing, unless
+`pg-advisory.schema.auto-create=true`. The auto-configuration backs off when you define your own
+`LockManager`, and `pg-advisory.enabled=false` switches it off.
 
 `ConnectionResetListener` beans are called when the lock connection was found broken and re-created:
 its locks are gone, so work running under them should stop.
@@ -90,11 +89,11 @@ instance holds it.
 
 ## Properties
 
-All under `spring.pg-advisory`.
+All under `pg-advisory`.
 
 | Property                                | Default              | Description                                                               |
 |-----------------------------------------|----------------------|---------------------------------------------------------------------------|
-| `enabled`                               | `false`              | Enables the auto-configuration.                                           |
+| `enabled`                               | `true`               | Enables the auto-configuration.                                           |
 | `table-name`                            | `advisory_lock`      | Lock table, optionally schema qualified.                                  |
 | `application-name`                      | `pg-advisory`        | `application_name` of the lock connection, visible in `pg_stat_activity`. |
 | `schema.auto-create`                    | `false`              | Creates the lock table on start when it does not exist.                   |

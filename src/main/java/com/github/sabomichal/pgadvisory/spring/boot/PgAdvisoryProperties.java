@@ -10,7 +10,7 @@ import java.time.Duration;
 /**
  * Configuration of pg-advisory. The defaults are the same as {@link LockManagerSettings#defaults()}.
  *
- * @param enabled             Whether to enable pg-advisory.
+ * @param enabled             Whether to enable the auto-configuration.
  * @param tableName           Lock table, optionally schema qualified.
  * @param applicationName     application_name of the lock connection, visible in pg_stat_activity.
  * @param initialLockTimeout  How long creating the lock manager waits for the lock connection.
@@ -19,9 +19,9 @@ import java.time.Duration;
  * @param retry               Waiting for the lock connection, which serves one operation at a time.
  * @param r2dbc               Dedicated connection of the lock manager.
  */
-@ConfigurationProperties("spring.pg-advisory")
+@ConfigurationProperties("pg-advisory")
 public record PgAdvisoryProperties(
-        @DefaultValue("false") boolean enabled,
+        @DefaultValue("true") boolean enabled,
         @DefaultValue("advisory_lock") String tableName,
         @DefaultValue("pg-advisory") String applicationName,
         @DefaultValue("30s") Duration initialLockTimeout,

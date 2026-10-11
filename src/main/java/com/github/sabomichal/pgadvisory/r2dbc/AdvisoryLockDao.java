@@ -43,7 +43,7 @@ final class AdvisoryLockDao {
                     }
                     if (!autoCreate) {
                         return Mono.error(new IllegalStateException(("Advisory lock table [%s] does not exist. Create it "
-                                + "(see classpath:db/pg-advisory/V1__advisory_lock.sql) or enable spring.pg-advisory.schema.auto-create")
+                                + "(see classpath:db/pg-advisory/V1__advisory_lock.sql) or enable pg-advisory.schema.auto-create")
                                 .formatted(tableName)));
                     }
                     return Flux.from(connection.createStatement(CREATE_TABLE.formatted(tableName)).execute())
