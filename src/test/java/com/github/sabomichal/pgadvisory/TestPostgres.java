@@ -6,28 +6,24 @@ import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactories;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.ConnectionFactoryOptions;
-import io.r2dbc.spi.Result;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.r2dbc.connection.init.ResourceDatabasePopulator;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Objects;
 import java.util.function.Function;
 
 /** One PostgreSQL container shared by all tests, with the lock table created by the script shipped in the jar. */
 public final class TestPostgres {
 
-    private static final String LOCK_TABLE_SCRIPT = "/db/pg-advisory/V1__advisory_lock.sql";
-    private static final Duration TIMEOUT = Duration.ofSeconds(30);
-
     private static final PostgreSQLContainer CONTAINER = start();
 
     static {
-        migrate();
+        new ResourceDatabasePopulator(new ClassPathResource("db/pg-advisory/V1__advisory_lock.sql"))
+                .populate(connectionFactory())
+                .block();
     }
 
     private TestPostgres() {
@@ -37,26 +33,6 @@ public final class TestPostgres {
         var container = new PostgreSQLContainer("postgres:16-alpine");
         container.start();
         return container;
-    }
-
-    /**
-     * Runs the script shipped in the jar, like the migrations of an application would. Step by step on the calling
-     * thread: it runs during the class initialization, and a lambda of this class called on a driver thread would
-     * wait for that initialization to finish.
-     */
-    private static void migrate() {
-        String script;
-        try (var in = TestPostgres.class.getResourceAsStream(LOCK_TABLE_SCRIPT)) {
-            script = new String(Objects.requireNonNull(in, LOCK_TABLE_SCRIPT).readAllBytes(), StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
-        var connection = await(Mono.from(connectionFactory().create()));
-        try {
-            Flux.from(connection.createStatement(script).execute()).concatMap(Result::getRowsUpdated).blockLast(TIMEOUT);
-        } finally {
-            await(Mono.from(connection.close()));
-        }
     }
 
     /** Unpooled, suitable for the lock session. */
@@ -99,7 +75,7 @@ public final class TestPostgres {
     }
 
     public static <T> T await(Mono<T> mono) {
-        return mono.block(TIMEOUT);
+        return mono.block(Duration.ofSeconds(30));
     }
 
     public static <T> Mono<T> withConnection(Function<Connection, Mono<T>> work) {
