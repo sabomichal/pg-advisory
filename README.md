@@ -81,7 +81,6 @@ lockManager.close();
 |-------------------------------------------------------|-------------------------------------------------------------------------|
 | `tryWithLock(key, function)`                          | Locks `key` without waiting, runs `function`, unlocks.                  |
 | `tryWithLock(key, onLock, onFinally, function)`       | The same, with callbacks right before and after `function`.             |
-| `unlock(key)`                                         | Releases the lock of `key`.                                             |
 | `validateDbConnection()`                              | Checks the lock connection and re-creates it when it is broken.         |
 
 A key that is locked fails with `LockOperationException`; `isSameInstance()` tells whether this

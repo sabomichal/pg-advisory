@@ -131,11 +131,6 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                         .doFinally(_ -> lock.unlock())));
     }
 
-    @Override
-    public Mono<String> unlock(String key) {
-        return unlockInternal(key);
-    }
-
     private Mono<String> lock(String key) {
         addToCurrentlyProcessingLocks(key);
         return obtainLock()
