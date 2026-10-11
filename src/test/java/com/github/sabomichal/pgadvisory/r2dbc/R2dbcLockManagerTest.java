@@ -88,15 +88,6 @@ class R2dbcLockManagerTest {
     }
 
     @Test
-    void unlockOfAKeyThatIsNotLockedReturnsTheKey() {
-        var lockManager = lockManager(settings("A"));
-        var key = newKey();
-        lockAndUnlock(lockManager, key);
-
-        assertThat(await(lockManager.unlock(key))).isEqualTo(key);
-    }
-
-    @Test
     void reconnectsWhenTheLockConnectionIsBroken() {
         var resets = new AtomicInteger();
         var applicationName = "lock-manager-" + UUID.randomUUID();

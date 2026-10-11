@@ -1,3 +1,4 @@
+
 package com.github.sabomichal.pgadvisory;
 
 import io.r2dbc.pool.ConnectionPool;
@@ -15,32 +16,44 @@ import reactor.core.publisher.Mono;
 import java.time.Duration;
 import java.util.function.Function;
 
-/** One PostgreSQL container shared by all tests, with the lock table created by the script shipped in the jar. */
+/**
+ * Shared PostgreSQL test container with the advisory lock schema initialized.
+ */
 public final class TestPostgres {
 
-    private static final PostgreSQLContainer CONTAINER = start();
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
+    private static final PostgreSQLContainer CONTAINER = new PostgreSQLContainer("postgres:18-alpine");
+    private static final ConnectionFactory CONNECTION_FACTORY;
+    private static final String SELECT_TERMINATED_SQL = """
+            SELECT count(*)
+            FROM (
+                SELECT pg_terminate_backend(pid, 10000) AS terminated
+                FROM pg_stat_activity
+                WHERE application_name = $1
+                  AND pid <> pg_backend_pid()
+            ) t
+            WHERE terminated
+            """;
 
     static {
-        new ResourceDatabasePopulator(new ClassPathResource("db/pg-advisory/V1__advisory_lock.sql"))
-                .populate(connectionFactory())
-                .block();
+        CONTAINER.start();
+        // the options need the mapped port of the started container
+        CONNECTION_FACTORY = ConnectionFactories.get(options("r2dbc:postgresql"));
+        await(new ResourceDatabasePopulator(
+                new ClassPathResource("db/pg-advisory/V1__advisory_lock.sql"))
+                .populate(CONNECTION_FACTORY));
     }
 
     private TestPostgres() {
     }
 
-    private static PostgreSQLContainer start() {
-        var container = new PostgreSQLContainer("postgres:16-alpine");
-        container.start();
-        return container;
-    }
-
-    /** Unpooled, suitable for the lock session. */
+    /**
+     * Unpooled connection factory for dedicated lock sessions.
+     */
     public static ConnectionFactory connectionFactory() {
-        return ConnectionFactories.get(options("r2dbc:postgresql"));
+        return CONNECTION_FACTORY;
     }
 
-    /** @param scheme e.g. {@code r2dbc:postgresql} or {@code r2dbc:pool:postgresql} */
     public static ConnectionFactoryOptions options(String scheme) {
         return ConnectionFactoryOptions.parse(url(scheme))
                 .mutate()
@@ -49,9 +62,12 @@ public final class TestPostgres {
                 .build();
     }
 
-    /** @param scheme e.g. {@code r2dbc:postgresql} or {@code r2dbc:pool:postgresql} */
     public static String url(String scheme) {
-        return "%s://%s:%d/%s".formatted(scheme, CONTAINER.getHost(), CONTAINER.getMappedPort(5432), CONTAINER.getDatabaseName());
+        return "%s://%s:%d/%s".formatted(
+                scheme,
+                CONTAINER.getHost(),
+                CONTAINER.getMappedPort(5432),
+                CONTAINER.getDatabaseName());
     }
 
     public static String username() {
@@ -62,38 +78,50 @@ public final class TestPostgres {
         return CONTAINER.getPassword();
     }
 
-    /** {@code spring.r2dbc.*} of the container, for {@code ApplicationContextRunner.withPropertyValues}. */
     public static String[] r2dbcProperties() {
         return new String[]{
                 "spring.r2dbc.url=" + url("r2dbc:postgresql"),
                 "spring.r2dbc.username=" + username(),
-                "spring.r2dbc.password=" + password()};
+                "spring.r2dbc.password=" + password()
+        };
     }
 
     public static ConnectionPool pool() {
-        return new ConnectionPool(ConnectionPoolConfiguration.builder(connectionFactory()).maxSize(10).build());
+        return new ConnectionPool(ConnectionPoolConfiguration.builder(CONNECTION_FACTORY)
+                .maxSize(10)
+                .build());
     }
 
     public static <T> T await(Mono<T> mono) {
-        return mono.block(Duration.ofSeconds(30));
+        return mono.block(TIMEOUT);
     }
 
     public static <T> Mono<T> withConnection(Function<Connection, Mono<T>> work) {
-        return Mono.usingWhen(connectionFactory().create(), work, Connection::close);
+        return Mono.usingWhen(CONNECTION_FACTORY.create(), work, Connection::close);
     }
 
+    /**
+     * Executes a query and counts its returned rows.
+     */
     public static Mono<Long> execute(Connection connection, String sql, Object... arguments) {
         var statement = connection.createStatement(sql);
-        for (var i = 0; i < arguments.length; i++) {
+        for (int i = 0; i < arguments.length; i++) {
             statement.bind(i, arguments[i]);
         }
-        return Flux.from(statement.execute()).concatMap(result -> result.map(_ -> 1L)).count();
+        return Flux.from(statement.execute())
+                .concatMap(result -> result.map((row, metadata) -> 1L))
+                .count();
     }
 
-    /** Kills the connections named {@code applicationName} and waits until they are gone; PostgreSQL releases their advisory locks. */
+    /**
+     * Terminates matching backends and returns the number successfully terminated.
+     */
     public static long terminateConnections(String applicationName) {
-        return await(withConnection(connection -> execute(connection,
-                "SELECT pg_terminate_backend(pid, 10000) FROM pg_stat_activity WHERE application_name = $1",
-                applicationName)));
+        return await(withConnection(connection ->
+                Mono.from(connection.createStatement(SELECT_TERMINATED_SQL)
+                                .bind(0, applicationName)
+                                .execute())
+                        .flatMap(result -> Mono.from(
+                                result.map((row, metadata) -> row.get(0, Long.class))))));
     }
 }

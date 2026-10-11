@@ -144,6 +144,9 @@ work on every probe, and compete with locking for the lock connection.
 The original code locked all abandoned keys of a table in one statement (`pg_try_advisory_lock` over
 the rows that nobody holds according to `pg_locks`) and marked them prepared in advance, so that the
 following `tryWithLock` reused the lock. Generalized: the application passes the candidate keys.
+A public `unlock(key)` comes back with it, for keys locked in bulk whose work could not be started;
+outside of that, `tryWithLock` releases its own locks and a public unlock could only release a lock
+under running work.
 
 ## 13. Kotlin extensions
 

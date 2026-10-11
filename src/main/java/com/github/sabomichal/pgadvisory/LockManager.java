@@ -21,6 +21,4 @@ public interface LockManager {
 
     /** Checks the lock connection and re-creates it when it is broken; its locks are gone then. */
     Mono<Void> validateDbConnection();
-
-    Mono<String> unlock(String key);
 }
