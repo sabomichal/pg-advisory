@@ -14,8 +14,6 @@
         <maven.compiler.showWarnings>true</maven.compiler.showWarnings>
 
         <spring-boot.version>4.0.6</spring-boot.version>
-        <!-- the version managed by spring-boot-dependencies -->
-        <kotlin.version>2.2.21</kotlin.version>
     </properties>
 
     <dependencyManagement>
@@ -50,11 +48,6 @@
 
         <!-- optional integrations -->
         <dependency>
-            <groupId>org.springframework</groupId>
-            <artifactId>spring-r2dbc</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-autoconfigure</artifactId>
             <optional>true</optional>
@@ -67,21 +60,6 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-health</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>io.micrometer</groupId>
-            <artifactId>micrometer-core</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>org.jetbrains.kotlin</groupId>
-            <artifactId>kotlin-stdlib</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>org.jetbrains.kotlinx</groupId>
-            <artifactId>kotlinx-coroutines-reactor</artifactId>
             <optional>true</optional>
         </dependency>
 
@@ -179,19 +157,6 @@
                             </configuration>
                         </execution>
                         <execution>
-                            <!-- so that the sources jar contains the Kotlin extensions too -->
-                            <id>add-kotlin-sources</id>
-                            <phase>generate-sources</phase>
-                            <goals>
-                                <goal>add-source</goal>
-                            </goals>
-                            <configuration>
-                                <sources>
-                                    <source>${project.basedir}/src/main/kotlin</source>
-                                </sources>
-                            </configuration>
-                        </execution>
-                        <execution>
                             <id>default-attach-artifact</id>
                             <inherited>false</inherited>
                             <phase>prepare-package</phase>
@@ -216,42 +181,6 @@
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>
-            </plugin>
-            <!-- Kotlin extensions; compiled after javac against the compiled Java classes -->
-            <plugin>
-                <groupId>org.jetbrains.kotlin</groupId>
-                <artifactId>kotlin-maven-plugin</artifactId>
-                <version>${kotlin.version}</version>
-                <configuration>
-                    <!-- the highest target of Kotlin 2.2; runs on the Java 25 baseline -->
-                    <jvmTarget>24</jvmTarget>
-                </configuration>
-                <executions>
-                    <execution>
-                        <id>kotlin-compile</id>
-                        <phase>process-classes</phase>
-                        <goals>
-                            <goal>compile</goal>
-                        </goals>
-                        <configuration>
-                            <sourceDirs>
-                                <sourceDir>${project.basedir}/src/main/kotlin</sourceDir>
-                            </sourceDirs>
-                        </configuration>
-                    </execution>
-                    <execution>
-                        <id>kotlin-test-compile</id>
-                        <phase>process-test-classes</phase>
-                        <goals>
-                            <goal>test-compile</goal>
-                        </goals>
-                        <configuration>
-                            <sourceDirs>
-                                <sourceDir>${project.basedir}/src/test/kotlin</sourceDir>
-                            </sourceDirs>
-                        </configuration>
-                    </execution>
-                </executions>
             </plugin>
             <plugin>
                 <groupId>org.sonatype.central</groupId>

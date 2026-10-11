@@ -1,29 +1,23 @@
 package com.github.sabomichal.pgadvisory.spring.boot;
 
-import com.github.sabomichal.pgadvisory.PgAdvisory;
+import com.github.sabomichal.pgadvisory.LockManager;
 import org.springframework.boot.health.contributor.Health;
 import org.springframework.boot.health.contributor.ReactiveHealthIndicator;
 import reactor.core.publisher.Mono;
 
-/** Up while the lock session is connected. */
+/** Up when the lock connection passes {@link LockManager#validateDbConnection()}. */
 public class PgAdvisoryHealthIndicator implements ReactiveHealthIndicator {
 
-    private final PgAdvisory<?> pgAdvisory;
+    private final LockManager lockManager;
 
-    public PgAdvisoryHealthIndicator(PgAdvisory<?> pgAdvisory) {
-        this.pgAdvisory = pgAdvisory;
+    public PgAdvisoryHealthIndicator(LockManager lockManager) {
+        this.lockManager = lockManager;
     }
 
     @Override
     public Mono<Health> health() {
-        return Mono.fromSupplier(() -> {
-            var state = pgAdvisory.state();
-            var health = state == PgAdvisory.ConnectionState.CONNECTED ? Health.up() : Health.down();
-            return health
-                    .withDetail("state", state)
-                    .withDetail("owner", pgAdvisory.owner())
-                    .withDetail("heldLocks", pgAdvisory.heldLocks())
-                    .build();
-        });
+        return lockManager.validateDbConnection()
+                .then(Mono.fromSupplier(() -> Health.up().build()))
+                .onErrorResume(error -> Mono.just(Health.down(error).build()));
     }
 }

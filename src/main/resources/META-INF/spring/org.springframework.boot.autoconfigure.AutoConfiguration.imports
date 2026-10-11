@@ -1,1 +1,1 @@
-com.github.sabomichal.pgadvisory.spring.PgAdvisoryAutoConfiguration
+com.github.sabomichal.pgadvisory.spring.boot.PgAdvisoryAutoConfiguration
