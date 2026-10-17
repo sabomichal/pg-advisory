@@ -1,9 +1,9 @@
 package com.github.sabomichal.pgadvisory.spring.boot;
 
+import com.github.sabomichal.pgadvisory.ConnectionResetListener;
 import com.github.sabomichal.pgadvisory.LockManager;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
-import com.github.sabomichal.pgadvisory.spring.PgAdvisoryConfiguration;
-import com.github.sabomichal.pgadvisory.spring.PgAdvisoryLockConnectionFactory;
+import com.github.sabomichal.pgadvisory.r2dbc.R2dbcLockManager;
 import io.r2dbc.spi.ConnectionFactories;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.ConnectionFactoryOptions;
@@ -21,7 +21,6 @@ import org.springframework.boot.r2dbc.autoconfigure.R2dbcAutoConfiguration;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcConnectionDetails;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Conditional;
-import org.springframework.context.annotation.Import;
 
 /**
  * Creates the {@link LockManager} when there is something to connect it with: {@code pg-advisory.r2dbc.url}, the
@@ -34,8 +33,18 @@ import org.springframework.context.annotation.Import;
 @ConditionalOnMissingBean(LockManager.class)
 @Conditional(PgAdvisoryAutoConfiguration.LockConnectionAvailable.class)
 @EnableConfigurationProperties(PgAdvisoryProperties.class)
-@Import(PgAdvisoryConfiguration.class)
 public class PgAdvisoryAutoConfiguration {
+
+    /** {@link ConnectionResetListener} beans are told when the lock connection was re-created and its locks are gone. */
+    @Bean(destroyMethod = "close")
+    public R2dbcLockManager lockManager(PgAdvisoryLockConnectionFactory lockConnectionFactory, LockManagerSettings settings,
+                                        ObjectProvider<ConnectionResetListener> connectionResetListeners) {
+        var listeners = connectionResetListeners.orderedStream().toList();
+        var lockManager = new R2dbcLockManager(lockConnectionFactory.connectionFactory(), settings,
+                () -> listeners.forEach(ConnectionResetListener::onConnectionReset));
+        lockManager.ensureTable().block();
+        return lockManager;
+    }
 
     @Bean
     @ConditionalOnMissingBean

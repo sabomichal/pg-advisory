@@ -13,9 +13,21 @@ lockManager.tryWithLock("order-42", key -> processOrder(key))
 
 ## Setup
 
-| pg-advisory | Spring Boot | Java | PostgreSQL R2DBC driver |
-|-------------|-------------|------|-------------------------|
-| `0.x`       | 4.0.x       | 25+  | `org.postgresql:r2dbc-postgresql` |
+| pg-advisory | Spring Boot (starter) | Java | PostgreSQL R2DBC driver |
+|-------------|-----------------------|------|-------------------------|
+| `0.x`       | 4.1.x                 | 25+  | `org.postgresql:r2dbc-postgresql` |
+
+With Spring Boot, add the starter:
+
+```xml
+<dependency>
+    <groupId>com.github.sabomichal</groupId>
+    <artifactId>pg-advisory-spring-boot-starter</artifactId>
+    <version>${pg-advisory.version}</version>
+</dependency>
+```
+
+Without Spring Boot, add the library alone; it depends on R2DBC and Reactor only:
 
 ```xml
 <dependency>
@@ -24,9 +36,6 @@ lockManager.tryWithLock("order-42", key -> processOrder(key))
     <version>${pg-advisory.version}</version>
 </dependency>
 ```
-
-Spring and Spring Boot are optional dependencies; the integration switches on when they are on the
-classpath.
 
 ### Lock table
 
@@ -44,7 +53,7 @@ CREATE TABLE IF NOT EXISTS advisory_lock
 
 ### Spring Boot
 
-Adding the dependency is enough: the auto-configuration registers a `LockManager` bean as soon as
+Adding the starter is enough: the auto-configuration registers a `LockManager` bean as soon as
 there is something to connect it with. The lock connection is a connection of its own, never one from
 the application's pool: from `pg-advisory.r2dbc.url` when it is set, otherwise with the
 application's connection details (`spring.r2dbc.*`, Testcontainers or Docker Compose service
@@ -58,11 +67,6 @@ On start the lock manager verifies the lock table and fails when it is missing, 
 `ConnectionResetListener` beans are called when the lock connection was found broken and re-created:
 its locks are gone, so work running under them should stop.
 
-### Spring without Boot
-
-Add `@EnablePgAdvisory` and a `PgAdvisoryLockConnectionFactory` bean with an unpooled
-`ConnectionFactory`, optionally a `LockManagerSettings` bean.
-
 ### Plain Java
 
 ```java
@@ -74,6 +78,8 @@ lockManager.ensureTable().block();
 // ...
 lockManager.close();
 ```
+
+In a Spring application without Boot, return it from a `@Bean` method; Spring closes it on shutdown.
 
 ## API
 

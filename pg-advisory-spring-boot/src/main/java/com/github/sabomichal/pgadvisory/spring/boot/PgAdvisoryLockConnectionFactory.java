@@ -1,4 +1,4 @@
-package com.github.sabomichal.pgadvisory.spring;
+package com.github.sabomichal.pgadvisory.spring.boot;
 
 import io.r2dbc.spi.ConnectionFactory;
 

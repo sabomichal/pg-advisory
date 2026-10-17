@@ -4,12 +4,9 @@ import com.github.sabomichal.pgadvisory.LockManager;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
 import com.github.sabomichal.pgadvisory.TestPostgres;
 import com.github.sabomichal.pgadvisory.r2dbc.R2dbcLockManager;
-import com.github.sabomichal.pgadvisory.spring.EnablePgAdvisory;
-import com.github.sabomichal.pgadvisory.spring.PgAdvisoryLockConnectionFactory;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.Option;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.BeanCreationException;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.context.annotation.ImportCandidates;
@@ -17,7 +14,6 @@ import org.springframework.boot.r2dbc.autoconfigure.ConnectionFactoryOptionsBuil
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcAutoConfiguration;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcConnectionDetails;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
-import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import reactor.core.publisher.Mono;
@@ -27,7 +23,6 @@ import java.util.UUID;
 import static com.github.sabomichal.pgadvisory.TestPostgres.await;
 import static com.github.sabomichal.pgadvisory.TestPostgres.execute;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PgAdvisoryAutoConfigurationTest {
 
@@ -111,23 +106,6 @@ class PgAdvisoryAutoConfigurationTest {
                 });
     }
 
-    @Test
-    void enablePgAdvisoryWorksWithoutSpringBoot() {
-        try (var context = new AnnotationConfigApplicationContext(EnableConfiguration.class)) {
-            var key = UUID.randomUUID().toString();
-
-            assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(key);
-        }
-    }
-
-    @Test
-    void enablePgAdvisoryRequiresALockConnectionFactory() {
-        assertThatThrownBy(() -> new AnnotationConfigApplicationContext(EnableWithoutLockFactoryConfiguration.class))
-                .isInstanceOf(BeanCreationException.class)
-                .hasRootCauseMessage("LockManager needs a PgAdvisoryLockConnectionFactory bean: an unpooled ConnectionFactory for the "
-                        + "lock connection, e.g. ConnectionFactories.get(\"r2dbc:postgresql://...\")");
-    }
-
     @Configuration(proxyBeanMethods = false)
     static class DatabaseConfiguration {
 
@@ -141,26 +119,6 @@ class PgAdvisoryAutoConfigurationTest {
         R2dbcConnectionDetails r2dbcConnectionDetails() {
             return () -> TestPostgres.options("r2dbc:pool:postgresql");
         }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    @EnablePgAdvisory
-    static class EnableConfiguration {
-
-        @Bean
-        PgAdvisoryLockConnectionFactory pgAdvisoryLockConnectionFactory() {
-            return new PgAdvisoryLockConnectionFactory(TestPostgres.connectionFactory());
-        }
-
-        @Bean
-        LockManagerSettings lockManagerSettings() {
-            return LockManagerSettings.builder().applicationName("enable").build();
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    @EnablePgAdvisory
-    static class EnableWithoutLockFactoryConfiguration {
     }
 
     /** Locks {@code key}, returns it from the locked function and unlocks. */
