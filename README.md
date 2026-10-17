@@ -99,7 +99,6 @@ All under `pg-advisory`.
 | `retry.max-attempts`                    | `100`                | How often an operation retries to get the lock connection.                |
 | `retry.min-backoff` / `max-backoff`     | `10ms` / `500ms`     | Delays between the retries.                                               |
 | `retry.jitter`                          | `0.5`                | Jitter factor of the delays.                                              |
-| `initial-lock-timeout`                  | `30s`                | How long creating the lock manager waits for the lock connection.         |
 | `shutdown-lock-timeout`                 | `30s`                | How long closing the lock manager waits for the lock connection.          |
 | `r2dbc.url` / `username` / `password`   | *(`spring.r2dbc.*`)* | Dedicated, unpooled lock connection.                                      |
 

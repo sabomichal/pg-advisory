@@ -105,6 +105,24 @@ class R2dbcLockManagerTest {
     }
 
     @Test
+    void createsAndClosesOnAnInterruptedThread() {
+        var other = lockManager(settings("B"));
+        var key = newKey();
+
+        Thread.currentThread().interrupt();
+        var lockManager = lockManager(settings("A"));
+        assertThat(Thread.interrupted()).isTrue();
+        hold(lockManager, key);
+
+        Thread.currentThread().interrupt();
+        lockManager.close();
+        assertThat(Thread.interrupted()).isTrue();
+
+        // PostgreSQL releases the session advisory lock once the closed connection's backend exits
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(lockAndUnlock(other, key)).isEqualTo(key));
+    }
+
+    @Test
     void missingTableFailsUnlessAutoCreateIsEnabled() {
         var table = "missing_" + UUID.randomUUID().toString().replace("-", "");
 

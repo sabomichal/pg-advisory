@@ -13,7 +13,6 @@ import java.time.Duration;
  * @param enabled             Whether to enable the auto-configuration.
  * @param tableName           Lock table, optionally schema qualified.
  * @param applicationName     application_name of the lock connection, visible in pg_stat_activity.
- * @param initialLockTimeout  How long creating the lock manager waits for the lock connection.
  * @param shutdownLockTimeout How long closing the lock manager waits for the lock connection.
  * @param schema              Lock table schema.
  * @param retry               Waiting for the lock connection, which serves one operation at a time.
@@ -24,7 +23,6 @@ public record PgAdvisoryProperties(
         @DefaultValue("true") boolean enabled,
         @DefaultValue("advisory_lock") String tableName,
         @DefaultValue("pg-advisory") String applicationName,
-        @DefaultValue("30s") Duration initialLockTimeout,
         @DefaultValue("30s") Duration shutdownLockTimeout,
         @DefaultValue Schema schema,
         @DefaultValue Retry retry,
@@ -70,7 +68,6 @@ public record PgAdvisoryProperties(
                 .retryMinBackoff(retry.minBackoff())
                 .retryMaxBackoff(retry.maxBackoff())
                 .retryJitter(retry.jitter())
-                .initialLockTimeout(initialLockTimeout)
                 .shutdownLockTimeout(shutdownLockTimeout)
                 .build();
     }

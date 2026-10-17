@@ -14,7 +14,6 @@ import java.util.regex.Pattern;
  * @param retryMinBackoff     first delay between the retries
  * @param retryMaxBackoff     maximal delay between the retries
  * @param retryJitter         jitter factor of the delays, 0 to 1
- * @param initialLockTimeout  how long creating the lock manager waits for the lock connection
  * @param shutdownLockTimeout how long closing the lock manager waits for the lock connection
  */
 public record LockManagerSettings(
@@ -25,7 +24,6 @@ public record LockManagerSettings(
         Duration retryMinBackoff,
         Duration retryMaxBackoff,
         double retryJitter,
-        Duration initialLockTimeout,
         Duration shutdownLockTimeout) {
 
     private static final Pattern TABLE_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?");
@@ -37,7 +35,6 @@ public record LockManagerSettings(
         Objects.requireNonNull(applicationName, "applicationName");
         Objects.requireNonNull(retryMinBackoff, "retryMinBackoff");
         Objects.requireNonNull(retryMaxBackoff, "retryMaxBackoff");
-        Objects.requireNonNull(initialLockTimeout, "initialLockTimeout");
         Objects.requireNonNull(shutdownLockTimeout, "shutdownLockTimeout");
     }
 
@@ -58,7 +55,6 @@ public record LockManagerSettings(
         private Duration retryMinBackoff = Duration.ofMillis(10);
         private Duration retryMaxBackoff = Duration.ofMillis(500);
         private double retryJitter = 0.5;
-        private Duration initialLockTimeout = Duration.ofSeconds(30);
         private Duration shutdownLockTimeout = Duration.ofSeconds(30);
 
         private Builder() {
@@ -99,11 +95,6 @@ public record LockManagerSettings(
             return this;
         }
 
-        public Builder initialLockTimeout(Duration initialLockTimeout) {
-            this.initialLockTimeout = initialLockTimeout;
-            return this;
-        }
-
         public Builder shutdownLockTimeout(Duration shutdownLockTimeout) {
             this.shutdownLockTimeout = shutdownLockTimeout;
             return this;
@@ -111,7 +102,7 @@ public record LockManagerSettings(
 
         public LockManagerSettings build() {
             return new LockManagerSettings(tableName, applicationName, autoCreateSchema, retryMaxAttempts, retryMinBackoff,
-                    retryMaxBackoff, retryJitter, initialLockTimeout, shutdownLockTimeout);
+                    retryMaxBackoff, retryJitter, shutdownLockTimeout);
         }
     }
 }

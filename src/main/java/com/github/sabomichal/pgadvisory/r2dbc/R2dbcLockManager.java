@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
 
+import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -56,47 +57,33 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                 .jitter(settings.retryJitter())
                 .filter(error -> error instanceof LockAcquisitionException)
                 .onRetryExhaustedThrow((_, _) -> new IllegalStateException("LockManager was unable to obtain lock"));
-
-        if (!tryLock(settings.initialLockTimeout().toMillis())) {
-            throw new LockAcquisitionException();
-        }
-        try {
-            this.connectionFactory = newConnectionFactory();
-        } finally {
-            lock.unlock();
-        }
+        this.connectionFactory = newConnectionFactory();
     }
 
     public R2dbcLockManager(ConnectionFactory lockConnectionFactory, LockManagerSettings settings) {
-        this(lockConnectionFactory, settings, () -> {
-        });
+        this(lockConnectionFactory, settings, () -> {});
     }
 
+    /**
+     * Waits for the running operation and closes the lock connection. An interrupt stops neither, otherwise the
+     * connection and its locks would stay open; the thread stays interrupted.
+     */
     @Override
     public void close() {
-        if (!tryLock(settings.shutdownLockTimeout().toMillis())) {
+        if (!tryLockUninterruptibly(settings.shutdownLockTimeout())) {
             throw new LockAcquisitionException();
         }
         try {
-            connectionFactory.destroy().block();
+            // unlike block(), join() keeps waiting when interrupted
+            connectionFactory.destroy().toFuture().join();
         } finally {
             lock.unlock();
         }
-    }
-
-    /** Verifies the lock table; creates it when it is missing and {@link LockManagerSettings#autoCreateSchema()}. */
-    public Mono<Void> ensureTable() {
-        return obtainLock()
-                .then(Mono.defer(() -> connectionFactory.create()
-                        .flatMap(connection -> dao.ensureTable(connection, settings.autoCreateSchema()))
-                        .doFinally(_ -> lock.unlock())));
     }
 
     @Override
     public <T> Mono<T> tryWithLock(String key, Function<String, Mono<T>> function) {
-        return tryWithLock(key, _ -> {
-        }, _ -> {
-        }, function);
+        return tryWithLock(key, _ -> {}, _ -> {}, function);
     }
 
     @Override
@@ -128,6 +115,14 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                         .doOnError(DbConnectionValidationException.class, _ -> reinitDbConnection())
                         .onErrorResume(R2dbcNonTransientResourceException.class, _ -> Mono.empty())
                         .onErrorResume(DbConnectionValidationException.class, _ -> Mono.empty())
+                        .doFinally(_ -> lock.unlock())));
+    }
+
+    /** Verifies the lock table; creates it when it is missing and {@link LockManagerSettings#autoCreateSchema()}. */
+    public Mono<Void> ensureTable() {
+        return obtainLock()
+                .then(Mono.defer(() -> connectionFactory.create()
+                        .flatMap(connection -> dao.ensureTable(connection, settings.autoCreateSchema()))
                         .doFinally(_ -> lock.unlock())));
     }
 
@@ -214,12 +209,21 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         }).retryWhen(lockRetrySpec);
     }
 
-    private boolean tryLock(long timeoutMillis) {
+    private boolean tryLockUninterruptibly(Duration timeout) {
+        var deadline = System.nanoTime() + timeout.toNanos();
+        var interrupted = false;
         try {
-            return lock.tryLock(timeoutMillis, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
+            while (true) {
+                try {
+                    return lock.tryLock(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
