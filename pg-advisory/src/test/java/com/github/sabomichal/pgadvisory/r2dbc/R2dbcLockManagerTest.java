@@ -13,6 +13,8 @@ import io.r2dbc.spi.R2dbcNonTransientResourceException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -21,8 +23,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.github.sabomichal.pgadvisory.TestPostgres.await;
 import static com.github.sabomichal.pgadvisory.TestPostgres.terminateConnections;
@@ -32,6 +36,8 @@ import static org.awaitility.Awaitility.await;
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class R2dbcLockManagerTest {
+
+    private static final Logger log = LoggerFactory.getLogger(R2dbcLockManagerTest.class);
 
     private final List<R2dbcLockManager> lockManagers = new ArrayList<>();
 
@@ -271,9 +277,38 @@ class R2dbcLockManagerTest {
                 .flatMap(key -> lockManager.tryWithLock(key, handle -> Mono.just(handle.key())))
                 .collectList()
                 .block(Duration.ofSeconds(120));
+        var elapsed = Duration.ofNanos(System.nanoTime() - started);
 
+        log.info("{} lock/unlock cycles in {} ms ({}/s)", keys.size(), elapsed.toMillis(),
+                keys.size() * 1000L / Math.max(1, elapsed.toMillis()));
         assertThat(outcomes).containsExactlyInAnyOrderElementsOf(completed(keys));
-        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(120));
+        assertThat(elapsed).isLessThan(Duration.ofSeconds(120));
+    }
+
+    @Test
+    void contendedKeysAreNeverHeldTwice() {
+        var a = lockManager(settings("A"));
+        var b = lockManager(settings("B"));
+        var keys = Flux.range(0, 10).map(_ -> newKey()).collectList().block();
+        var holders = new ConcurrentHashMap<String, AtomicInteger>();
+        var overlaps = new AtomicInteger();
+
+        // A and B take turns on the same keys
+        var outcomes = Flux.range(0, 1000)
+                .flatMap(i -> (i % 2 == 0 ? a : b).tryWithLock(keys.get((i / 2) % keys.size()), handle -> {
+                    var holder = holders.computeIfAbsent(handle.key(), _ -> new AtomicInteger());
+                    if (holder.incrementAndGet() > 1) {
+                        overlaps.incrementAndGet();
+                    }
+                    return Mono.delay(Duration.ofMillis(1)).thenReturn(handle.key()).doFinally(_ -> holder.decrementAndGet());
+                }), 512)
+                .collectList()
+                .block(Duration.ofSeconds(120));
+
+        assertThat(overlaps).hasValue(0);
+        assertThat(outcomes).hasSize(1000)
+                .hasAtLeastOneElementOfType(LockOutcome.Completed.class)
+                .hasAtLeastOneElementOfType(LockOutcome.Busy.class);
     }
 
     // ------------------------------------------------------------------ helpers

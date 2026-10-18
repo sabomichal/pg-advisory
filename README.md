@@ -191,6 +191,10 @@ one operation at a time; others wait with backoff (`retry.*`).
 mvn verify      # needs Docker for Testcontainers
 ```
 
+JMH benchmarks are in the tests of `pg-advisory`, in `R2dbcLockManagerBenchmark`: `throughput` (lock/unlock cycles
+per second with 1, 16 or 256 at once) and `latency1`, `latency16`, `latency256` (latency percentiles of one cycle
+among 1, 16 or 256 callers). Run its `main` in the IDE, with JMH options such as `latency -wi 1 -i 2`. They need Docker too.
+
 See [DEPLOYMENT.md](DEPLOYMENT.md) for releasing to Maven Central.
 
 ## License
