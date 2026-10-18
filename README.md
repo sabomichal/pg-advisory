@@ -7,8 +7,11 @@ Distributed locks on PostgreSQL session advisory locks, for Java, R2DBC and Reac
 Spring Boot auto-configuration. All locks of an instance are held by one dedicated connection.
 
 ```java
-lockManager.tryWithLock("order-42", key -> processOrder(key))
-        .onErrorResume(LockOperationException.class, busy -> Mono.empty());   // locked elsewhere
+lockManager.tryWithLock("order-42", handle -> processOrder(handle.key()))
+        .flatMap(outcome -> switch (outcome) {
+            case LockOutcome.Completed<Order>(var order) -> Mono.just(order);
+            case LockOutcome.Busy<Order> _ -> Mono.empty();   // locked elsewhere or already running here
+        });
 ```
 
 ## Setup
@@ -83,14 +86,25 @@ In a Spring application without Boot, return it from a `@Bean` method; Spring cl
 
 ## API
 
-| Method                                                | Does                                                                    |
-|-------------------------------------------------------|-------------------------------------------------------------------------|
-| `tryWithLock(key, function)`                          | Locks `key` without waiting, runs `function`, unlocks.                  |
-| `tryWithLock(key, onLock, onFinally, function)`       | The same, with callbacks right before and after `function`.             |
-| `validateDbConnection()`                              | Checks the lock connection and re-creates it when it is broken.         |
+| Method                                      | Does                                                                        |
+|---------------------------------------------|-----------------------------------------------------------------------------|
+| `tryWithLock(key, work)`                    | Locks `key` without waiting, runs `work`, unlocks; returns a `LockOutcome`. |
+| `tryWithLock(key, onLock, onFinally, work)` | The same, with callbacks right before and after `work`.                     |
+| `validateDbConnection()`                    | Checks the lock connection and re-creates it when it is broken.             |
 
-A key that is locked fails with `LockOperationException`; `isSameInstance()` tells whether this
-instance holds it.
+`tryWithLock` returns a sealed `LockManager.LockOutcome`:
+
+- `Completed(value)`: the work finished with `value` while the lock was held. When the work completes
+  empty, e.g. a `Mono<Void>`, `tryWithLock` completes empty as well.
+- `Busy(sameInstance)`: the key is locked, by this instance when `sameInstance`, otherwise by another
+  one; the work did not run and the callbacks were not called.
+
+It fails with `LockFailedException` when the key could not be locked because of an error, e.g. the
+database is unreachable; the work did not run then either. Errors of the work and of the unlock are
+propagated unchanged.
+
+The work and the callbacks get a `LockManager.LockHandle` with the key. The handle is also in the Reactor context of the work, so
+code deep inside it finds the lock with `LockHandle.current()`.
 
 ## Properties
 
@@ -113,16 +127,16 @@ All under `pg-advisory`.
 `tryWithLock` locks the key twice:
 
 1. **In memory**, so that the same instance cannot lock it again: session advisory locks are
-   reentrant on the one lock connection.
+   reentrant on the one lock connection. A key held here is `Busy(sameInstance = true)`.
 2. **In PostgreSQL**, on the shared lock connection:
    ```sql
    BEGIN;
    INSERT INTO advisory_lock (lock_key) VALUES (:key) ON CONFLICT (lock_key) DO NOTHING;
-   SELECT pg_try_advisory_lock(id) FROM advisory_lock WHERE lock_key = :key;  -- false → LockOperationException
+   SELECT pg_try_advisory_lock(id) FROM advisory_lock WHERE lock_key = :key;  -- false → Busy(sameInstance = false)
    COMMIT;
    ```
 
-Then `function` runs, and the lock is released with `pg_advisory_unlock`. The lock connection serves
+Then `work` runs, and the lock is released with `pg_advisory_unlock`. The lock connection serves
 one operation at a time; others wait with backoff (`retry.*`).
 
 ## Limitations

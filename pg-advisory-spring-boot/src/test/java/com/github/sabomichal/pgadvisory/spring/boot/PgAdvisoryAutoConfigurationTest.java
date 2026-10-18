@@ -1,6 +1,7 @@
 package com.github.sabomichal.pgadvisory.spring.boot;
 
 import com.github.sabomichal.pgadvisory.LockManager;
+import com.github.sabomichal.pgadvisory.LockManager.LockOutcome;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
 import com.github.sabomichal.pgadvisory.TestPostgres;
 import com.github.sabomichal.pgadvisory.r2dbc.R2dbcLockManager;
@@ -43,7 +44,7 @@ class PgAdvisoryAutoConfigurationTest {
             assertThat(context).hasNotFailed();
             var key = UUID.randomUUID().toString();
 
-            assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(key);
+            assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(new LockOutcome.Completed<>(key));
         });
     }
 
@@ -75,7 +76,7 @@ class PgAdvisoryAutoConfigurationTest {
                 .run(context -> {
                     var key = UUID.randomUUID().toString();
 
-                    assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(key);
+                    assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(new LockOutcome.Completed<>(key));
                 });
     }
 
@@ -99,7 +100,7 @@ class PgAdvisoryAutoConfigurationTest {
                 .run(context -> {
                     var key = UUID.randomUUID().toString();
 
-                    assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(key);
+                    assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(new LockOutcome.Completed<>(key));
                     var lockTables = TestPostgres.withConnection(connection -> execute(connection,
                             "SELECT 1 WHERE to_regclass($1) IS NOT NULL", schema + ".advisory_lock"));
                     assertThat(await(lockTables)).isEqualTo(1L);
@@ -121,8 +122,8 @@ class PgAdvisoryAutoConfigurationTest {
         }
     }
 
-    /** Locks {@code key}, returns it from the locked function and unlocks. */
-    private static String lockAndUnlock(LockManager lockManager, String key) {
-        return await(lockManager.tryWithLock(key, Mono::just));
+    /** Locks {@code key}, returns it from the locked work and unlocks. */
+    private static LockOutcome<String> lockAndUnlock(LockManager lockManager, String key) {
+        return await(lockManager.tryWithLock(key, handle -> Mono.just(handle.key())));
     }
 }

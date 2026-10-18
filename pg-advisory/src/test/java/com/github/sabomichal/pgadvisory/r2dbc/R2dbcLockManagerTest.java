@@ -1,9 +1,14 @@
 package com.github.sabomichal.pgadvisory.r2dbc;
 
+import com.github.sabomichal.pgadvisory.LockFailedException;
 import com.github.sabomichal.pgadvisory.LockManager;
+import com.github.sabomichal.pgadvisory.LockManager.LockHandle;
+import com.github.sabomichal.pgadvisory.LockManager.LockOutcome;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
-import com.github.sabomichal.pgadvisory.LockOperationException;
 import com.github.sabomichal.pgadvisory.TestPostgres;
+import io.r2dbc.spi.ConnectionFactories;
+import io.r2dbc.spi.ConnectionFactory;
+import io.r2dbc.spi.R2dbcNonTransientResourceException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -16,6 +21,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.github.sabomichal.pgadvisory.TestPostgres.await;
@@ -40,11 +46,11 @@ class R2dbcLockManagerTest {
         var lockManager = lockManager(settings("A"));
         var keys = Flux.range(0, 10).map(_ -> newKey()).collectList().block();
 
-        var locked = await(Flux.fromIterable(keys)
-                .flatMap(key -> lockManager.tryWithLock(key, lockedKey -> Mono.just(lockedKey).delayElement(Duration.ofMillis(10))))
+        var outcomes = await(Flux.fromIterable(keys)
+                .flatMap(key -> lockManager.tryWithLock(key, handle -> Mono.just(handle.key()).delayElement(Duration.ofMillis(10))))
                 .collectList());
 
-        assertThat(locked).containsExactlyInAnyOrderElementsOf(keys);
+        assertThat(outcomes).containsExactlyInAnyOrderElementsOf(completed(keys));
     }
 
     @Test
@@ -53,13 +59,12 @@ class R2dbcLockManagerTest {
         var key = newKey();
         var holder = hold(lockManager, key);
 
-        assertThatThrownBy(() -> lockAndUnlock(lockManager, key))
-                .isInstanceOfSatisfying(LockOperationException.class, error -> assertThat(error.isSameInstance()).isTrue());
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Busy<>(true));
         var other = newKey();
-        assertThat(lockAndUnlock(lockManager, other)).isEqualTo(other);
+        assertThat(lockAndUnlock(lockManager, other)).isEqualTo(new LockOutcome.Completed<>(other));
 
         holder.release();
-        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(key);
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
     }
 
     @Test
@@ -69,22 +74,80 @@ class R2dbcLockManagerTest {
         var key = newKey();
         var holder = hold(a, key);
 
-        assertThatThrownBy(() -> lockAndUnlock(b, key))
-                .isInstanceOfSatisfying(LockOperationException.class, error -> assertThat(error.isSameInstance()).isFalse());
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Busy<>(false));
 
         holder.release();
-        assertThat(lockAndUnlock(b, key)).isEqualTo(key);
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
     }
 
     @Test
-    void callsOnLockBeforeAndOnFinallyAfterTheFunction() {
+    void workGetsItsHandleAlsoInTheReactorContext() {
         var lockManager = lockManager(settings("A"));
+        var key = newKey();
+
+        var outcome = await(lockManager.tryWithLock(key, handle -> LockHandle.current()
+                .doOnNext(current -> assertThat(current).isSameAs(handle))
+                .map(LockHandle::key)));
+
+        assertThat(outcome).isEqualTo(new LockOutcome.Completed<>(key));
+        assertThat(await(LockHandle.current())).isNull();
+    }
+
+    @Test
+    void callsOnLockBeforeAndOnFinallyAfterTheWork() {
+        var lockManager = lockManager(settings("A"));
+        var key = newKey();
         var calls = new CopyOnWriteArrayList<String>();
 
-        await(lockManager.tryWithLock(newKey(), _ -> calls.add("lock"), _ -> calls.add("finally"),
-                key -> Mono.fromRunnable(() -> calls.add("function")).thenReturn(key)));
+        await(lockManager.tryWithLock(key, handle -> calls.add("lock " + handle.key()), handle -> calls.add("finally " + handle.key()),
+                _ -> Mono.fromRunnable(() -> calls.add("work"))));
 
-        assertThat(calls).containsExactly("lock", "function", "finally");
+        assertThat(calls).containsExactly("lock " + key, "work", "finally " + key);
+    }
+
+    @Test
+    void busyKeyDoesNotCallTheCallbacks() {
+        var lockManager = lockManager(settings("A"));
+        var key = newKey();
+        var holder = hold(lockManager, key);
+        var calls = new CopyOnWriteArrayList<String>();
+
+        var outcome = await(lockManager.tryWithLock(key, _ -> calls.add("lock"), _ -> calls.add("finally"), _ -> Mono.just("work")));
+
+        assertThat(outcome).isEqualTo(new LockOutcome.Busy<>(true));
+        assertThat(calls).isEmpty();
+        holder.release();
+    }
+
+    @Test
+    void errorOfTheWorkIsPropagatedAndTheKeyIsUnlocked() {
+        var lockManager = lockManager(settings("A"));
+        var key = newKey();
+        var failure = new IllegalStateException("work failed");
+
+        assertThatThrownBy(() -> await(lockManager.tryWithLock(key, _ -> Mono.error(failure)))).isSameAs(failure);
+
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
+    void emptyWorkCompletesEmptyAndUnlocks() {
+        var lockManager = lockManager(settings("A"));
+        var key = newKey();
+
+        assertThat(await(lockManager.tryWithLock(key, _ -> Mono.empty()))).isNull();
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
+    void unreachableDatabaseFailsWithLockFailedException() {
+        var lockManager = lockManager(ConnectionFactories.get("r2dbc:postgresql://user:password@localhost:1/db"), settings("A"), () -> {});
+        var workRan = new AtomicBoolean();
+
+        assertThatThrownBy(() -> await(lockManager.tryWithLock(newKey(), _ -> Mono.fromRunnable(() -> workRan.set(true)))))
+                .isInstanceOf(LockFailedException.class)
+                .hasCauseInstanceOf(R2dbcNonTransientResourceException.class);
+        assertThat(workRan).isFalse();
     }
 
     @Test
@@ -92,7 +155,7 @@ class R2dbcLockManagerTest {
         var resets = new AtomicInteger();
         var applicationName = "lock-manager-" + UUID.randomUUID();
         var lockManager = lockManager(settings(applicationName), resets::incrementAndGet);
-        await(lockManager.tryWithLock(newKey(), Mono::just));
+        lockAndUnlock(lockManager, newKey());
 
         assertThat(terminateConnections(applicationName)).isEqualTo(1);
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
@@ -101,7 +164,7 @@ class R2dbcLockManagerTest {
         });
 
         var key = newKey();
-        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(key);
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
     }
 
     @Test
@@ -119,7 +182,8 @@ class R2dbcLockManagerTest {
         assertThat(Thread.interrupted()).isTrue();
 
         // PostgreSQL releases the session advisory lock once the closed connection's backend exits
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(lockAndUnlock(other, key)).isEqualTo(key));
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(lockAndUnlock(other, key)).isEqualTo(new LockOutcome.Completed<>(key)));
     }
 
     @Test
@@ -133,7 +197,7 @@ class R2dbcLockManagerTest {
         var lockManager = lockManager(settings("B").tableName(table).autoCreateSchema(true));
         await(lockManager.ensureTable());
         var key = newKey();
-        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(key);
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
     }
 
     @Test
@@ -142,24 +206,28 @@ class R2dbcLockManagerTest {
         var keys = Flux.range(0, 1000).map(_ -> newKey()).collectList().block();
 
         var started = System.nanoTime();
-        var locked = Flux.fromIterable(keys)
-                .flatMap(key -> lockManager.tryWithLock(key, Mono::just))
+        var outcomes = Flux.fromIterable(keys)
+                .flatMap(key -> lockManager.tryWithLock(key, handle -> Mono.just(handle.key())))
                 .collectList()
                 .block(Duration.ofSeconds(120));
 
-        assertThat(locked).hasSize(keys.size());
+        assertThat(outcomes).containsExactlyInAnyOrderElementsOf(completed(keys));
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(120));
     }
 
     // ------------------------------------------------------------------ helpers
 
     private R2dbcLockManager lockManager(LockManagerSettings.Builder settings) {
-        return lockManager(settings, () -> {
-        });
+        return lockManager(settings, () -> {});
     }
 
     private R2dbcLockManager lockManager(LockManagerSettings.Builder settings, Runnable onConnectionReset) {
-        var lockManager = new R2dbcLockManager(TestPostgres.connectionFactory(), settings.build(), onConnectionReset::run);
+        return lockManager(TestPostgres.connectionFactory(), settings, onConnectionReset);
+    }
+
+    private R2dbcLockManager lockManager(ConnectionFactory connectionFactory, LockManagerSettings.Builder settings,
+                                         Runnable onConnectionReset) {
+        var lockManager = new R2dbcLockManager(connectionFactory, settings.build(), onConnectionReset::run);
         lockManagers.add(lockManager);
         return lockManager;
     }
@@ -173,15 +241,15 @@ class R2dbcLockManagerTest {
     private static Holder hold(R2dbcLockManager lockManager, String key) {
         var locked = new CompletableFuture<Void>();
         var release = new CompletableFuture<Void>();
-        var outcome = lockManager.tryWithLock(key, lockedKey -> {
+        var outcome = lockManager.tryWithLock(key, handle -> {
             locked.complete(null);
-            return Mono.fromFuture(release).thenReturn(lockedKey);
+            return Mono.fromFuture(release).thenReturn(handle.key());
         }).toFuture();
         locked.join();
         return new Holder(release, outcome);
     }
 
-    private record Holder(CompletableFuture<Void> releaseSignal, CompletableFuture<String> outcome) {
+    private record Holder(CompletableFuture<Void> releaseSignal, CompletableFuture<LockOutcome<String>> outcome) {
         void release() {
             releaseSignal.complete(null);
             outcome.join();
@@ -192,8 +260,12 @@ class R2dbcLockManagerTest {
         return UUID.randomUUID().toString();
     }
 
-    /** Locks {@code key}, returns it from the locked function and unlocks. */
-    private static String lockAndUnlock(LockManager lockManager, String key) {
-        return await(lockManager.tryWithLock(key, Mono::just));
+    private static List<LockOutcome<String>> completed(List<String> keys) {
+        return keys.stream().<LockOutcome<String>>map(LockOutcome.Completed::new).toList();
+    }
+
+    /** Locks {@code key}, returns it from the locked work and unlocks. */
+    private static LockOutcome<String> lockAndUnlock(LockManager lockManager, String key) {
+        return await(lockManager.tryWithLock(key, handle -> Mono.just(handle.key())));
     }
 }

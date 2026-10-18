@@ -16,9 +16,7 @@ import reactor.core.publisher.Mono;
 import java.time.Duration;
 import java.util.function.Function;
 
-/**
- * Shared PostgreSQL test container with the advisory lock schema initialized.
- */
+/** Shared PostgreSQL test container with the advisory lock schema initialized. */
 public final class TestPostgres {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(30);
@@ -47,9 +45,7 @@ public final class TestPostgres {
     private TestPostgres() {
     }
 
-    /**
-     * Unpooled connection factory for dedicated lock sessions.
-     */
+    /** Unpooled connection factory for dedicated lock sessions. */
     public static ConnectionFactory connectionFactory() {
         return CONNECTION_FACTORY;
     }
@@ -100,9 +96,7 @@ public final class TestPostgres {
         return Mono.usingWhen(CONNECTION_FACTORY.create(), work, Connection::close);
     }
 
-    /**
-     * Executes a query and counts its returned rows.
-     */
+    /** Executes a query and counts its returned rows. */
     public static Mono<Long> execute(Connection connection, String sql, Object... arguments) {
         var statement = connection.createStatement(sql);
         for (int i = 0; i < arguments.length; i++) {
@@ -113,9 +107,7 @@ public final class TestPostgres {
                 .count();
     }
 
-    /**
-     * Terminates matching backends and returns the number successfully terminated.
-     */
+    /** Terminates matching backends and returns the number successfully terminated. */
     public static long terminateConnections(String applicationName) {
         return await(withConnection(connection ->
                 Mono.from(connection.createStatement(SELECT_TERMINATED_SQL)

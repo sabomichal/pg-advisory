@@ -35,7 +35,7 @@ import org.springframework.context.annotation.Conditional;
 @EnableConfigurationProperties(PgAdvisoryProperties.class)
 public class PgAdvisoryAutoConfiguration {
 
-    /** {@link ConnectionResetListener} beans are told when the lock connection was re-created and its locks are gone. */
+    /** {@link ConnectionResetListener} beans learn when the lock connection was re-created and its locks are gone. */
     @Bean(destroyMethod = "close")
     public R2dbcLockManager lockManager(PgAdvisoryLockConnectionFactory lockConnectionFactory, LockManagerSettings settings,
                                         ObjectProvider<ConnectionResetListener> connectionResetListeners) {

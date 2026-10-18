@@ -1,9 +1,10 @@
 package com.github.sabomichal.pgadvisory.r2dbc;
 
 import com.github.sabomichal.pgadvisory.ConnectionResetListener;
+import com.github.sabomichal.pgadvisory.LockFailedException;
 import com.github.sabomichal.pgadvisory.LockManager;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
-import com.github.sabomichal.pgadvisory.LockOperationException;
+import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.R2dbcNonTransientResourceException;
 import io.r2dbc.spi.ValidationDepth;
@@ -65,8 +66,8 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
     }
 
     /**
-     * Waits for the running operation and closes the lock connection. An interrupt stops neither, otherwise the
-     * connection and its locks would stay open; the thread stays interrupted.
+     * Waits for the running operation and closes the lock connection even when interrupted, so that its locks are
+     * released. The thread stays interrupted.
      */
     @Override
     public void close() {
@@ -82,22 +83,24 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
     }
 
     @Override
-    public <T> Mono<T> tryWithLock(String key, Function<String, Mono<T>> function) {
-        return tryWithLock(key, _ -> {}, _ -> {}, function);
+    public <T> Mono<LockOutcome<T>> tryWithLock(String key, Function<LockHandle, Mono<T>> work) {
+        return tryWithLock(key, _ -> {}, _ -> {}, work);
     }
 
     @Override
-    public <T> Mono<T> tryWithLock(String key, Consumer<String> onLock, Consumer<String> onFinally, Function<String, Mono<T>> function) {
-        log.debug("Acquiring pg session advisory lock for key=[{}]", key);
+    public <T> Mono<LockOutcome<T>> tryWithLock(
+            String key, Consumer<LockHandle> onLock, Consumer<LockHandle> onFinally, Function<LockHandle, Mono<T>> work) {
         return Mono.usingWhen(
                         Mono.defer(() -> lock(key)),
-                        lockedKey -> Mono.defer(() -> function.apply(lockedKey))
-                                .doFirst(() -> onLock.accept(lockedKey))
-                                .doFinally(_ -> onFinally.accept(lockedKey)),
-                        lockedKey -> {
-                            log.debug("Releasing pg session advisory lock for key=[{}]", lockedKey);
-                            return unlockInternal(lockedKey);
-                        })
+                        lockAcquisition -> switch (lockAcquisition) {
+                            case LockAcquisition.Locked(var handle) -> Mono.defer(() -> work.apply(handle))
+                                    .contextWrite(context -> context.put(LockHandle.CONTEXT_KEY, handle))
+                                    .doFirst(() -> onLock.accept(handle))
+                                    .doFinally(_ -> onFinally.accept(handle))
+                                    .<LockOutcome<T>>map(LockOutcome.Completed::new);
+                            case LockAcquisition.Busy(var sameInstance) -> Mono.just(new LockOutcome.Busy<T>(sameInstance));
+                        },
+                        lockAcquisition -> lockAcquisition instanceof LockAcquisition.Locked ? unlockInternal(key) : Mono.empty())
                 .doOnError(error -> {
                     if (rootCause(error) instanceof R2dbcNonTransientResourceException) {
                         validateDbConnection().subscribe();
@@ -118,7 +121,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                         .doFinally(_ -> lock.unlock())));
     }
 
-    /** Verifies the lock table; creates it when it is missing and {@link LockManagerSettings#autoCreateSchema()}. */
+    /** Verifies the lock table, creates a missing one when {@link LockManagerSettings#autoCreateSchema()}. */
     public Mono<Void> ensureTable() {
         return obtainLock()
                 .then(Mono.defer(() -> connectionFactory.create()
@@ -126,35 +129,49 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                         .doFinally(_ -> lock.unlock())));
     }
 
-    private Mono<String> lock(String key) {
-        addToCurrentlyProcessingLocks(key);
+    private Mono<LockAcquisition> lock(String key) {
+        if (!currentlyProcessingLocks.add(key)) {
+            log.debug("[{}] Busy key=[{}], held by this instance", settings.applicationName(), key);
+            return Mono.just(new LockAcquisition.Busy(true));
+        }
         return obtainLock()
                 .then(Mono.defer(() -> connectionFactory.create()
                         .flatMap(connection -> Mono.from(connection.beginTransaction())
                                 .then(dao.createLockRecord(connection, key))
-                                .doOnNext(rowsUpdated -> {
-                                    if (rowsUpdated > 0) {
-                                        log.trace("DB lock record created [{}] - {}", settings.applicationName(), key);
-                                    } else {
-                                        log.trace("DB lock record already exists [{}] - {}", settings.applicationName(), key);
-                                    }
-                                })
+                                .doOnNext(rowsUpdated -> log.trace(rowsUpdated > 0
+                                        ? "[{}] Lock record created key=[{}]"
+                                        : "[{}] Lock record exists key=[{}]", settings.applicationName(), key))
                                 .then(dao.lock(connection, key))
-                                .flatMap(locked -> {
-                                    if (!locked) {
-                                        log.trace("DB lock error [{}] - {}", settings.applicationName(), key);
-                                        return Mono.error(new LockOperationException("Could not acquire lock for key=[" + key + "]"));
-                                    }
-                                    log.trace("DB lock OK [{}] - {}", settings.applicationName(), key);
-                                    log.trace("DB commit [{}] - {}", settings.applicationName(), key);
-                                    return Mono.from(connection.commitTransaction()).thenReturn(key);
-                                })
+                                .flatMap(locked -> locked
+                                        ? commitLocked(connection, key)
+                                        : rollbackBusy(connection, key))
                                 .onErrorResume(error -> {
-                                    log.trace("DB rollback [{}] - {}", settings.applicationName(), key);
+                                    log.trace("[{}] Rollback key=[{}]", settings.applicationName(), key);
                                     return Mono.from(connection.rollbackTransaction()).then(Mono.error(error));
                                 }))
                         .doFinally(_ -> lock.unlock())))
-                .doOnError(_ -> removeFromCurrentlyProcessingLocks(key));
+                .doOnError(error -> {
+                    currentlyProcessingLocks.remove(key);
+                    log.debug("[{}] Lock failed key=[{}]", settings.applicationName(), key, error);
+                })
+                .onErrorMap(error -> new LockFailedException("Could not lock key=[" + key + "]", error));
+    }
+
+    private Mono<LockAcquisition> commitLocked(Connection connection, String key) {
+        log.trace("[{}] Commit key=[{}]", settings.applicationName(), key);
+        return Mono.from(connection.commitTransaction())
+                .<LockAcquisition>thenReturn(new LockAcquisition.Locked(new DefaultLockHandle(key)))
+                .doOnNext(_ -> log.debug("[{}] Locked key=[{}]", settings.applicationName(), key));
+    }
+
+    private Mono<LockAcquisition> rollbackBusy(Connection connection, String key) {
+        log.trace("[{}] Rollback key=[{}]", settings.applicationName(), key);
+        return Mono.from(connection.rollbackTransaction())
+                .<LockAcquisition>thenReturn(new LockAcquisition.Busy(false))
+                .doOnNext(_ -> {
+                    currentlyProcessingLocks.remove(key);
+                    log.debug("[{}] Busy key=[{}], held by another instance", settings.applicationName(), key);
+                });
     }
 
     private Mono<String> unlockInternal(String key) {
@@ -162,19 +179,22 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                 .then(Mono.defer(() -> connectionFactory.create()
                         .flatMap(connection -> dao.unlock(connection, key))
                         .map(unlocked -> {
-                            if (!unlocked) {
-                                log.warn("Could not release lock for key=[{}] - already released", key);
+                            if (unlocked) {
+                                log.debug("[{}] Unlocked key=[{}]", settings.applicationName(), key);
                             } else {
-                                log.trace("DB lock released [{}] - {}", settings.applicationName(), key);
+                                log.warn("[{}] Unlock found key=[{}] already released, the lock connection was "
+                                        + "probably re-created", settings.applicationName(), key);
                             }
                             return key;
                         })
-                        .doOnSuccess(_ -> removeFromCurrentlyProcessingLocks(key))
-                        .doFinally(_ -> lock.unlock())));
+                        .doOnSuccess(_ -> currentlyProcessingLocks.remove(key))
+                        .doFinally(_ -> lock.unlock())))
+                .doOnError(error -> log.warn("[{}] Unlock failed key=[{}], it stays busy on this instance "
+                        + "until the lock connection is re-created", settings.applicationName(), key, error));
     }
 
     private void reinitDbConnection() {
-        log.warn("LockManager DB connection is invalid, reinitializing");
+        log.warn("[{}] Lock connection is broken, re-creating it, all its locks are lost", settings.applicationName());
         connectionResetListener.onConnectionReset();
         connectionFactory.destroy().subscribe();
         connectionFactory = newConnectionFactory();
@@ -184,19 +204,6 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         currentlyProcessingLocks.clear();
         return new SingleConnectionFactory(lockConnectionFactory,
                 connection -> dao.setApplicationName(connection, settings.applicationName()));
-    }
-
-    private void addToCurrentlyProcessingLocks(String key) {
-        if (!currentlyProcessingLocks.add(key)) {
-            log.trace("MEM lock error [{}] - {}", settings.applicationName(), key);
-            throw new LockOperationException("Could not acquire lock for key=[" + key + "]", true);
-        }
-        log.trace("MEM lock OK [{}] - {}", settings.applicationName(), key);
-    }
-
-    private void removeFromCurrentlyProcessingLocks(String key) {
-        log.trace("MEM lock released [{}] - {}", settings.applicationName(), key);
-        currentlyProcessingLocks.remove(key);
     }
 
     /** The lock connection serves one operation at a time: waits for it with backoff, see the retry settings. */
@@ -233,6 +240,16 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
             cause = cause.getCause();
         }
         return cause;
+    }
+
+    /** What {@link #lock} got: the lock, or a key locked by this or another instance. */
+    private sealed interface LockAcquisition {
+
+        record Locked(LockHandle handle) implements LockAcquisition {
+        }
+
+        record Busy(boolean sameInstance) implements LockAcquisition {
+        }
     }
 
     /** The lock connection is busy with another operation. */

@@ -15,8 +15,8 @@ then fencing, then convenience.
 connection. When the caller cancels in between (a timeout, a disconnected client), the chain stops:
 `onErrorResume` (rollback) does not run on cancel, so the shared connection can stay inside an open
 transaction, the session advisory lock may stay held, and `doOnError` does not remove the in-memory
-entry, so the key reports `sameInstance` forever. `usingWhen` never got the resource, so it unlocks
-nothing.
+entry, so the key is `Busy(sameInstance = true)` forever. `usingWhen` never got the resource, so it
+unlocks nothing.
 
 **Solution.** The lock is the resource of `Mono.usingWhen`; a result that arrives after the caller
 left is handed to a callback that releases it (`SerialExecutor.submit(task, onAbandoned)`, which
@@ -40,7 +40,7 @@ a failed transaction has rolled back. If the unlock fails too, discard the lock 
 **Problem.** The mutex of the lock connection is released in `doFinally`, i.e. after the result was
 delivered: an operation started right after the completion finds it busy and waits a backoff. On
 `full-implementation` the same pattern made a lock taken right after the release fail with
-`HeldLocally`, and `stop().then(start())` fail on `STOPPING`.
+`HeldLocally` (here `Busy(sameInstance = true)`), and `stop().then(start())` fail on `STOPPING`.
 
 **Solution.** State changes that the caller must see belong in `doOnTerminate`, before the terminal
 signal. *Tests:* `theSameKeyCanBeLockedRightAfterTheRelease`, `startRightAfterStop`.
@@ -48,8 +48,9 @@ signal. *Tests:* `theSameKeyCanBeLockedRightAfterTheRelease`, `startRightAfterSt
 ## 4. The lock connection is a polled mutex
 
 **Problem.** Every operation polls `StampedLock.tryLock()` with backoff. Under load it gives up after
-`retry.max-attempts` with `IllegalStateException("LockManager was unable to obtain lock")`, and the
-backoff costs throughput: 1 000 concurrent locks take about 30 s in `locksManyKeysInTime`.
+`retry.max-attempts`: locking fails with `LockFailedException`, the other operations with
+`IllegalStateException("LockManager was unable to obtain lock")`. And the backoff costs throughput:
+1 000 concurrent locks take about 30 s in `locksManyKeysInTime`.
 
 **Solution.** A FIFO queue of operations on the lock connection, one at a time, without polling and
 without a retry limit: `SerialExecutor` (`Sinks.many().unicast()` + `concatMap`). An operation runs to
@@ -64,6 +65,12 @@ locks while PostgreSQL has released them. An idle lock connection may even be cl
 so the same instance can lock a key again next to it, and the old work's unlock hits the new
 connection.
 
+A failed connect is never retried. `SingleConnectionFactory` keeps the error in `Mono.cache()`, so every
+later `tryWithLock` fails with the same `LockFailedException`. The validation that would re-create the
+connection does not start either: it needs `R2dbcNonTransientResourceException` as the root cause, but
+a refused connect is `R2dbcNonTransientResourceException <- AnnotatedConnectException <- ConnectException`.
+The instance stays unusable until the application calls `validateDbConnection` or restarts.
+
 **Solution.** A heartbeat (`validate(REMOTE)` with a timeout), detection of broken sessions from
 errors, reconnect with backoff, and *incarnations*: every reconnect starts a new one, and unlocks of
 an older incarnation are skipped. Running work is told about the loss: `LostLockPolicy.CANCEL_WORK`
@@ -71,12 +78,16 @@ cancels it, `NOTIFY` lets it run. Local registrations stay until the work ends.
 *Classes:* `R2dbcLockSession`, `R2dbcPgAdvisory` (heartbeat, `connectionLost`, `startReconnect`).
 *Tests:* `lostSessionCancelsTheWorkAndReconnects`.
 
+This also fixes the failed connect, if the reconnect does not keep a failed attempt and the error
+detection looks at the whole cause chain. *Test to add:* a `ConnectionFactory` that refuses the first
+connects with `R2dbcNonTransientResourceException(new ConnectException())`, after which a later lock succeeds.
+
 ## 6. Fencing
 
 **Problem.** After the lock connection died, another instance can take over the key while work of the
 old holder is still running. Nothing stops its commits: both write.
 
-**Solution.** Every acquisition increments the `generation` column of the key's row, the fencing token.
+**Solution.** Every lockAcquisition increments the `generation` column of the key's row, the fencing token.
 Every work transaction checks its token right before `COMMIT` under a shared advisory barrier lock,
 and a new holder takes the barrier exclusively, so it waits for in-flight commits of the previous
 holder. `FencingR2dbcTransactionManager` does the check for Spring transactions, `fence(connection)`
@@ -115,13 +126,24 @@ racing with a detected loss still stops. Spring drives it through `SmartLifecycl
 *Tests:* `stopDrainsRunningWorkAndStartWorksAgain`, `stopCancelsWorkAfterTheShutdownTimeout`,
 `cancelledStopStillDrainsAndClosesTheLockSession`, `cancelledStartStillConnects`, `startRightAfterStop`.
 
-## 9. Typed outcomes
+## 9. Typed outcomes (done)
 
-**Problem.** A busy key is an exception, mixed with real failures of the work.
+**Problem.** A busy key was an exception, mixed with real failures of the work.
 
-**Solution.** `withLock` returns a sealed `LockOutcome`: `Completed`, `Busy(owner)`, `HeldLocally`,
-`Lost`, `Unavailable`, so the compiler checks that each is handled. The `LockHandle` is passed to the
-work and is in its Reactor context (`LockHandle.current()`).
+**Done.** `tryWithLock` returns a sealed `LockManager.LockOutcome`: `Completed(value)` and
+`Busy(sameInstance)`. The work and the `onLock`/`onFinally` callbacks get a `LockHandle` with the key,
+which is also in the Reactor context of the work (`LockHandle.current()`).
+It differs from `full-implementation` on purpose: sealed variants are only the cases the caller reacts to
+differently.
+
+- `HeldLocally` is `Busy(sameInstance = true)`, from step 10 on also for colliding `localKey`s.
+- `Unavailable` is not an outcome but the error `LockFailedException(cause)`: the key could not be
+  locked because of an error, and the work did not run.
+- `Completed` never holds `null`. Empty work, e.g. a `Mono<Void>`, makes `tryWithLock` complete empty.
+
+Later steps add `Lost` (step 5), `Busy.owner` (step 10), and the fencing token in `Completed` and
+`LockHandle` together with its `lost()` and `verify()` (steps 5 and 6). Empty work has no `Completed`,
+so its token is only in the `LockHandle`.
 
 ## 10. Keys and the lock record
 

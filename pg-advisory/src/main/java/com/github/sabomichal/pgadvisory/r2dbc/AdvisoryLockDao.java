@@ -8,12 +8,11 @@ import reactor.core.publisher.Mono;
 
 import java.util.function.Function;
 
-/**
- * SQL of the lock table: one row per key, whose {@code id} is the advisory lock id.
- */
+/** SQL of the lock table: one row per key, whose {@code id} is the advisory lock id. */
 final class AdvisoryLockDao {
 
-    private static final String TABLE_EXISTS = "SELECT to_regclass($1) IS NOT NULL";
+    private static final String TABLE_EXISTS = """
+            SELECT to_regclass($1) IS NOT NULL""";
 
     private static final String CREATE_TABLE = """
             CREATE TABLE IF NOT EXISTS %s (
@@ -21,13 +20,23 @@ final class AdvisoryLockDao {
                 lock_key text   NOT NULL UNIQUE
             )""";
 
-    private static final String SET_APPLICATION_NAME = "SELECT set_config('application_name', $1, false)";
+    private static final String SET_APPLICATION_NAME = """
+            SELECT set_config('application_name', $1, false)""";
 
-    private static final String CREATE_LOCK_RECORD = "INSERT INTO %s (lock_key) VALUES ($1) ON CONFLICT (lock_key) DO NOTHING";
+    private static final String CREATE_LOCK_RECORD = """
+            INSERT INTO %s (lock_key)
+            VALUES ($1)
+            ON CONFLICT (lock_key) DO NOTHING""";
 
-    private static final String LOCK = "SELECT pg_try_advisory_lock(id) AS lock_result FROM %s WHERE lock_key = $1";
+    private static final String LOCK = """
+            SELECT pg_try_advisory_lock(id) AS lock_result
+            FROM %s
+            WHERE lock_key = $1""";
 
-    private static final String UNLOCK = "SELECT pg_advisory_unlock(id) AS unlock_result FROM %s WHERE lock_key = $1";
+    private static final String UNLOCK = """
+            SELECT pg_advisory_unlock(id) AS unlock_result
+            FROM %s
+            WHERE lock_key = $1""";
 
     private final String tableName;
 
