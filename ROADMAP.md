@@ -153,13 +153,20 @@ An `owner` column, a `LockRecordWriter` for extra columns and a lookup of the ho
 original code the lock record held an RPC endpoint for routing requests to the holder).
 *Tests:* `directKeyMapperCollisionOnlyContends`, `directKeyMapperCollisionIsHeldLocallyWithinOneInstance`.
 
-## 11. Observability
+## 11. Observability (partly done)
 
-`AdvisoryLockListener` callbacks (acquired, failed, released, lost, connection lost/restored), Spring
-application events (sealed `PgAdvisoryEvents`), Micrometer metrics (`pg.advisory.*`) and a health
-indicator that reports the state of the lock connection from the heartbeat (step 5), without side
-effects. A health indicator on `validateDbConnection` would re-create the connection and stop running
-work on every probe, and compete with locking for the lock connection.
+**Done.** `LockManagerListener` with `onLocked`, `onBusy`, `onLockFailed`, `onReleased` and
+`onConnectionReset`, which replaced `ConnectionResetListener`. Every `onLocked` is followed by exactly one
+`onReleased`, also after a failed unlock, so that the gauge of held locks stays consistent. On top of it
+Spring application events (sealed `PgAdvisoryEvents`) and Micrometer metrics (`pg.advisory.*`,
+`MicrometerLockManagerListener`, registered when there is a `MeterRegistry`). Unlike `full-implementation`, a
+failed lock is `onLockFailed` with the `LockFailedException`, not an outcome (see step 9). The
+notifications move with steps 1, 4 and 5, the listener stays.
+
+**With step 5.** `onLost`, `onConnectionRestored` and a health indicator that reports the state of the
+lock connection from the heartbeat, without side effects. A health indicator on `validateDbConnection`
+would re-create the connection and stop running work on every probe, and compete with locking for the
+lock connection.
 
 ## 12. Locking abandoned keys in bulk
 

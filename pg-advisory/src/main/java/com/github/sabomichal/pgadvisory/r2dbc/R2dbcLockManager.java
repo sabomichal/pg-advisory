@@ -1,8 +1,8 @@
 package com.github.sabomichal.pgadvisory.r2dbc;
 
-import com.github.sabomichal.pgadvisory.ConnectionResetListener;
 import com.github.sabomichal.pgadvisory.LockFailedException;
 import com.github.sabomichal.pgadvisory.LockManager;
+import com.github.sabomichal.pgadvisory.LockManagerListener;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
 import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactory;
@@ -14,6 +14,7 @@ import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -34,7 +35,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
 
     private final ConnectionFactory lockConnectionFactory;
     private final LockManagerSettings settings;
-    private final ConnectionResetListener connectionResetListener;
+    private final List<LockManagerListener> listeners;
     private final AdvisoryLockDao dao;
     private final Retry lockRetrySpec;
 
@@ -44,14 +45,14 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
     private volatile SingleConnectionFactory connectionFactory;
 
     /**
-     * @param lockConnectionFactory   unpooled factory of the lock connection
-     * @param connectionResetListener called when the lock connection is re-created and its locks are gone
+     * @param lockConnectionFactory unpooled factory of the lock connection
+     * @param listeners             called in order, a failing one is logged and does not stop the others
      */
     public R2dbcLockManager(ConnectionFactory lockConnectionFactory, LockManagerSettings settings,
-                            ConnectionResetListener connectionResetListener) {
+                            List<? extends LockManagerListener> listeners) {
         this.lockConnectionFactory = lockConnectionFactory;
         this.settings = settings;
-        this.connectionResetListener = connectionResetListener;
+        this.listeners = List.copyOf(listeners);
         this.dao = new AdvisoryLockDao(settings.tableName());
         this.lockRetrySpec = Retry.backoff(settings.retryMaxAttempts(), settings.retryMinBackoff())
                 .maxBackoff(settings.retryMaxBackoff())
@@ -61,13 +62,14 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         this.connectionFactory = newConnectionFactory();
     }
 
+    /** Without listeners. */
     public R2dbcLockManager(ConnectionFactory lockConnectionFactory, LockManagerSettings settings) {
-        this(lockConnectionFactory, settings, () -> {});
+        this(lockConnectionFactory, settings, List.of());
     }
 
     /**
-     * Waits for the running operation and closes the lock connection even when interrupted, so that its locks are
-     * released. The thread stays interrupted.
+     * Waits up to the shutdown lock timeout for the running operation, else throws {@link LockAcquisitionException}.
+     * Closes the lock connection even when interrupted, so that its locks are released. The thread stays interrupted.
      */
     @Override
     public void close() {
@@ -93,14 +95,14 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         return Mono.usingWhen(
                         Mono.defer(() -> lock(key)),
                         lockAcquisition -> switch (lockAcquisition) {
-                            case LockAcquisition.Locked(var handle) -> Mono.defer(() -> work.apply(handle))
+                            case LockAcquisition.Locked(var handle, _) -> Mono.defer(() -> work.apply(handle))
                                     .contextWrite(context -> context.put(LockHandle.CONTEXT_KEY, handle))
                                     .doFirst(() -> onLock.accept(handle))
                                     .doFinally(_ -> onFinally.accept(handle))
                                     .<LockOutcome<T>>map(LockOutcome.Completed::new);
                             case LockAcquisition.Busy(var sameInstance) -> Mono.just(new LockOutcome.Busy<T>(sameInstance));
                         },
-                        lockAcquisition -> lockAcquisition instanceof LockAcquisition.Locked ? unlockInternal(key) : Mono.empty())
+                        lockAcquisition -> lockAcquisition instanceof LockAcquisition.Locked locked ? unlockInternal(locked) : Mono.empty())
                 .doOnError(error -> {
                     if (rootCause(error) instanceof R2dbcNonTransientResourceException) {
                         validateDbConnection().subscribe();
@@ -130,8 +132,10 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
     }
 
     private Mono<LockAcquisition> lock(String key) {
+        var started = System.nanoTime();
         if (!currentlyProcessingLocks.add(key)) {
             log.debug("[{}] Busy key=[{}], held by this instance", settings.applicationName(), key);
+            notifyListeners(listener -> listener.onBusy(key, new LockOutcome.Busy<>(true), since(started)));
             return Mono.just(new LockAcquisition.Busy(true));
         }
         return obtainLock()
@@ -143,8 +147,8 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                                         : "[{}] Lock record exists key=[{}]", settings.applicationName(), key))
                                 .then(dao.lock(connection, key))
                                 .flatMap(locked -> locked
-                                        ? commitLocked(connection, key)
-                                        : rollbackBusy(connection, key))
+                                        ? commitLocked(connection, key, started)
+                                        : rollbackBusy(connection, key, started))
                                 .onErrorResume(error -> {
                                     log.trace("[{}] Rollback key=[{}]", settings.applicationName(), key);
                                     return Mono.from(connection.rollbackTransaction()).then(Mono.error(error));
@@ -154,27 +158,35 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                     currentlyProcessingLocks.remove(key);
                     log.debug("[{}] Lock failed key=[{}]", settings.applicationName(), key, error);
                 })
-                .onErrorMap(error -> new LockFailedException("Could not lock key=[" + key + "]", error));
+                .onErrorMap(error -> new LockFailedException("Could not lock key=[" + key + "]", error))
+                .doOnError(LockFailedException.class,
+                        error -> notifyListeners(listener -> listener.onLockFailed(key, error, since(started))));
     }
 
-    private Mono<LockAcquisition> commitLocked(Connection connection, String key) {
+    private Mono<LockAcquisition> commitLocked(Connection connection, String key, long started) {
         log.trace("[{}] Commit key=[{}]", settings.applicationName(), key);
         return Mono.from(connection.commitTransaction())
-                .<LockAcquisition>thenReturn(new LockAcquisition.Locked(new DefaultLockHandle(key)))
-                .doOnNext(_ -> log.debug("[{}] Locked key=[{}]", settings.applicationName(), key));
+                .then(Mono.fromSupplier(() -> {
+                    var locked = new LockAcquisition.Locked(new DefaultLockHandle(key), System.nanoTime());
+                    log.debug("[{}] Locked key=[{}]", settings.applicationName(), key);
+                    notifyListeners(listener -> listener.onLocked(locked.handle(), Duration.ofNanos(locked.lockedNanos() - started)));
+                    return locked;
+                }));
     }
 
-    private Mono<LockAcquisition> rollbackBusy(Connection connection, String key) {
+    private Mono<LockAcquisition> rollbackBusy(Connection connection, String key, long started) {
         log.trace("[{}] Rollback key=[{}]", settings.applicationName(), key);
         return Mono.from(connection.rollbackTransaction())
                 .<LockAcquisition>thenReturn(new LockAcquisition.Busy(false))
                 .doOnNext(_ -> {
                     currentlyProcessingLocks.remove(key);
                     log.debug("[{}] Busy key=[{}], held by another instance", settings.applicationName(), key);
+                    notifyListeners(listener -> listener.onBusy(key, new LockOutcome.Busy<>(false), since(started)));
                 });
     }
 
-    private Mono<String> unlockInternal(String key) {
+    private Mono<String> unlockInternal(LockAcquisition.Locked locked) {
+        var key = locked.handle().key();
         return obtainLock()
                 .then(Mono.defer(() -> connectionFactory.create()
                         .flatMap(connection -> dao.unlock(connection, key))
@@ -190,12 +202,13 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                         .doOnSuccess(_ -> currentlyProcessingLocks.remove(key))
                         .doFinally(_ -> lock.unlock())))
                 .doOnError(error -> log.warn("[{}] Unlock failed key=[{}], it stays busy on this instance "
-                        + "until the lock connection is re-created", settings.applicationName(), key, error));
+                        + "until the lock connection is re-created", settings.applicationName(), key, error))
+                .doOnTerminate(() -> notifyListeners(listener -> listener.onReleased(locked.handle(), since(locked.lockedNanos()))));
     }
 
     private void reinitDbConnection() {
         log.warn("[{}] Lock connection is broken, re-creating it, all its locks are lost", settings.applicationName());
-        connectionResetListener.onConnectionReset();
+        notifyListeners(LockManagerListener::onConnectionReset);
         connectionFactory.destroy().subscribe();
         connectionFactory = newConnectionFactory();
     }
@@ -234,6 +247,20 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         }
     }
 
+    private void notifyListeners(Consumer<LockManagerListener> callback) {
+        for (var listener : listeners) {
+            try {
+                callback.accept(listener);
+            } catch (RuntimeException e) {
+                log.warn("[{}] Listener [{}] failed", settings.applicationName(), listener, e);
+            }
+        }
+    }
+
+    private static Duration since(long startedNanos) {
+        return Duration.ofNanos(System.nanoTime() - startedNanos);
+    }
+
     private static Throwable rootCause(Throwable error) {
         var cause = error;
         while (cause.getCause() != null && cause.getCause() != cause) {
@@ -245,7 +272,8 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
     /** What {@link #lock} got: the lock, or a key locked by this or another instance. */
     private sealed interface LockAcquisition {
 
-        record Locked(LockHandle handle) implements LockAcquisition {
+        /** {@code lockedNanos} by {@link System#nanoTime()}, for the hold time. */
+        record Locked(LockHandle handle, long lockedNanos) implements LockAcquisition {
         }
 
         record Busy(boolean sameInstance) implements LockAcquisition {

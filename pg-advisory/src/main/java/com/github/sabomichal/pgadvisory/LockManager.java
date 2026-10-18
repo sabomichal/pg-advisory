@@ -29,11 +29,10 @@ public interface LockManager {
 
         /** The work finished under the lock with {@code value}. */
         record Completed<T>(T value) implements LockOutcome<T> {
-
         }
+
         /** Locked by this instance when {@code sameInstance}, otherwise by another one. The work did not run. */
         record Busy<T>(boolean sameInstance) implements LockOutcome<T> {
-
         }
     }
 
@@ -48,6 +47,7 @@ public interface LockManager {
             return Mono.deferContextual(context -> Mono.justOrEmpty(context.getOrEmpty(CONTEXT_KEY)));
         }
 
+        /** The key passed to {@link #tryWithLock}. */
         String key();
     }
 }

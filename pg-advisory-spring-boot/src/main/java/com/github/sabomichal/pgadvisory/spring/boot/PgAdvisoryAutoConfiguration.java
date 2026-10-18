@@ -1,9 +1,11 @@
 package com.github.sabomichal.pgadvisory.spring.boot;
 
-import com.github.sabomichal.pgadvisory.ConnectionResetListener;
 import com.github.sabomichal.pgadvisory.LockManager;
+import com.github.sabomichal.pgadvisory.LockManagerListener;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
+import com.github.sabomichal.pgadvisory.micrometer.MicrometerLockManagerListener;
 import com.github.sabomichal.pgadvisory.r2dbc.R2dbcLockManager;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.r2dbc.spi.ConnectionFactories;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.ConnectionFactoryOptions;
@@ -19,15 +21,18 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.boot.r2dbc.autoconfigure.ConnectionFactoryOptionsBuilderCustomizer;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcAutoConfiguration;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcConnectionDetails;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Conditional;
+import org.springframework.context.annotation.Configuration;
 
 /**
  * Creates the {@link LockManager} when there is something to connect it with: {@code pg-advisory.r2dbc.url}, the
  * application's R2DBC connection details, or a {@link PgAdvisoryLockConnectionFactory} bean. Backs off when the
  * application defines its own {@code LockManager} or sets {@code pg-advisory.enabled=false}.
  */
-@AutoConfiguration(after = R2dbcAutoConfiguration.class)
+@AutoConfiguration(after = R2dbcAutoConfiguration.class,
+        afterName = "org.springframework.boot.micrometer.metrics.autoconfigure.CompositeMeterRegistryAutoConfiguration")
 @ConditionalOnClass({ConnectionFactory.class, R2dbcConnectionDetails.class})
 @ConditionalOnBooleanProperty(name = "pg-advisory.enabled", matchIfMissing = true)
 @ConditionalOnMissingBean(LockManager.class)
@@ -35,21 +40,28 @@ import org.springframework.context.annotation.Conditional;
 @EnableConfigurationProperties(PgAdvisoryProperties.class)
 public class PgAdvisoryAutoConfiguration {
 
-    /** {@link ConnectionResetListener} beans learn when the lock connection was re-created and its locks are gone. */
+    /** Verifies the lock table on start. Gets all {@link LockManagerListener} beans, in their order. */
     @Bean(destroyMethod = "close")
     public R2dbcLockManager lockManager(PgAdvisoryLockConnectionFactory lockConnectionFactory, LockManagerSettings settings,
-                                        ObjectProvider<ConnectionResetListener> connectionResetListeners) {
-        var listeners = connectionResetListeners.orderedStream().toList();
+                                        ObjectProvider<LockManagerListener> listeners) {
         var lockManager = new R2dbcLockManager(lockConnectionFactory.connectionFactory(), settings,
-                () -> listeners.forEach(ConnectionResetListener::onConnectionReset));
+                listeners.orderedStream().toList());
         lockManager.ensureTable().block();
         return lockManager;
     }
 
+    /** From the {@code pg-advisory.*} properties. */
     @Bean
     @ConditionalOnMissingBean
     public LockManagerSettings lockManagerSettings(PgAdvisoryProperties properties) {
         return properties.toSettings();
+    }
+
+    /** Publishes the callbacks of the lock manager as {@link PgAdvisoryEvents}. */
+    @Bean
+    @ConditionalOnMissingBean
+    public ApplicationEventPublishingListener pgAdvisoryEventPublishingListener(ApplicationEventPublisher publisher) {
+        return new ApplicationEventPublishingListener(publisher);
     }
 
     /**
@@ -93,6 +105,19 @@ public class PgAdvisoryAutoConfiguration {
                 .option(ConnectionFactoryOptions.DRIVER, protocol[0])
                 .option(ConnectionFactoryOptions.PROTOCOL, protocol.length == 2 ? protocol[1] : "")
                 .build();
+    }
+
+    /** Metrics when the application has a {@link MeterRegistry}, e.g. from Spring Boot Actuator. */
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(MeterRegistry.class)
+    @ConditionalOnBean(MeterRegistry.class)
+    static class PgAdvisoryMetricsConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean
+        MicrometerLockManagerListener pgAdvisoryMetricsListener(MeterRegistry registry) {
+            return new MicrometerLockManagerListener(registry);
+        }
     }
 
     /** There is something to create the lock connection from. */

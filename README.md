@@ -67,8 +67,8 @@ On start the lock manager verifies the lock table and fails when it is missing, 
 `pg-advisory.schema.auto-create=true`. The auto-configuration backs off when you define your own
 `LockManager`, and `pg-advisory.enabled=false` switches it off.
 
-`ConnectionResetListener` beans are called when the lock connection was found broken and re-created:
-its locks are gone, so work running under them should stop.
+`LockManagerListener` beans get the callbacks of the lock manager, and with a `MeterRegistry` it
+records metrics, see [Observability](#observability).
 
 ### Plain Java
 
@@ -76,7 +76,7 @@ its locks are gone, so work running under them should stop.
 var lockManager = new R2dbcLockManager(
         ConnectionFactories.get("r2dbc:postgresql://user:password@localhost/app"),   // unpooled
         LockManagerSettings.builder().autoCreateSchema(true).build(),
-        () -> log.warn("Lock connection re-created, all locks are gone"));
+        List.of(new MicrometerLockManagerListener(meterRegistry)));                  // optional
 lockManager.ensureTable().block();
 // ...
 lockManager.close();
@@ -105,6 +105,41 @@ propagated unchanged.
 
 The work and the callbacks get a `LockManager.LockHandle` with the key. The handle is also in the Reactor context of the work, so
 code deep inside it finds the lock with `LockHandle.current()`.
+
+## Observability
+
+A `LockManagerListener` gets a callback for every lock attempt and every release:
+
+| Callback            | When                                                                                     |
+|---------------------|------------------------------------------------------------------------------------------|
+| `onLocked`          | The key was locked, right before the work starts.                                        |
+| `onBusy`            | The key was busy, with the `Busy` outcome.                                               |
+| `onLockFailed`      | Locking failed with `LockFailedException`.                                               |
+| `onReleased`        | After the unlock, also a failed one. Every `onLocked` is followed by exactly one.        |
+| `onConnectionReset` | The lock connection was found broken and re-created. Its locks are gone, so work running under them should stop. |
+
+The lock callbacks get the time it took to lock, including the wait for the lock connection, and
+`onReleased` the time the lock was held. The callbacks run on the locking path, so keep them fast and
+non-blocking. A listener that throws is logged and affects neither the locking nor the other listeners.
+
+With Spring Boot every `LockManagerListener` bean is registered, and the auto-configuration adds two:
+
+- The callbacks are published as Spring application events, the sealed `PgAdvisoryEvents`: `Locked`,
+  `Busy`, `LockFailed`, `Released` and `ConnectionReset`. They are published synchronously on the
+  locking path as well.
+- With a Micrometer `MeterRegistry`, e.g. from Spring Boot Actuator, `MicrometerLockManagerListener`
+  records:
+
+| Metric                          | Type    | Description                                                                                         |
+|---------------------------------|---------|-----------------------------------------------------------------------------------------------------|
+| `pg.advisory.lock`              | timer   | Time to lock a key, tag `outcome`: `locked`, `busy_same_instance`, `busy_other_instance`, `failed`. |
+| `pg.advisory.hold`              | timer   | Time a lock was held.                                                                               |
+| `pg.advisory.locks.held`        | gauge   | Locks held now.                                                                                     |
+| `pg.advisory.connection.resets` | counter | Re-creations of a broken lock connection.                                                           |
+
+Without Spring Boot, pass a `MicrometerLockManagerListener` to the constructor. `micrometer-core` is an
+optional dependency. A health indicator comes later: it needs a heartbeat of the lock connection, see
+[ROADMAP.md](ROADMAP.md).
 
 ## Properties
 
@@ -143,7 +178,7 @@ one operation at a time; others wait with backoff (`retry.*`).
 
 - **No fencing.** When the lock connection dies, PostgreSQL releases its locks and another instance
   can take over, while work of this instance may still be running and committing. Only
-  `validateDbConnection` notices it, and then calls the `ConnectionResetListener`s.
+  `validateDbConnection` notices it, and then calls `LockManagerListener.onConnectionReset`.
 - Known weaknesses of the current implementation, e.g. cancelling during locking or the retry
   limit of the lock connection under load, and how they are going to be fixed step by step:
   see [ROADMAP.md](ROADMAP.md).

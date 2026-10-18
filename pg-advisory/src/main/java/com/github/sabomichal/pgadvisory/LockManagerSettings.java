@@ -28,6 +28,7 @@ public record LockManagerSettings(
 
     private static final Pattern TABLE_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?");
 
+    /** {@code tableName} goes into the SQL as is, so it must be an identifier, optionally schema qualified. */
     public LockManagerSettings {
         if (!TABLE_NAME.matcher(tableName).matches()) {
             throw new IllegalArgumentException("Invalid table name [" + tableName + "]");
@@ -38,14 +39,20 @@ public record LockManagerSettings(
         Objects.requireNonNull(shutdownLockTimeout, "shutdownLockTimeout");
     }
 
+    /** Settings of a new {@link #builder()}. */
     public static LockManagerSettings defaults() {
         return builder().build();
     }
 
+    /**
+     * Starts from the defaults: table {@code advisory_lock}, application name {@code pg-advisory}, no auto-create,
+     * 100 retries 10 ms to 500 ms apart with jitter 0.5, and 30 s shutdown lock timeout.
+     */
     public static Builder builder() {
         return new Builder();
     }
 
+    /** Each setter sets the component of the same name, see {@link LockManagerSettings}. */
     public static final class Builder {
 
         private String tableName = "advisory_lock";

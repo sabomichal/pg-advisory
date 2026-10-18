@@ -1,10 +1,15 @@
 package com.github.sabomichal.pgadvisory.spring.boot;
 
 import com.github.sabomichal.pgadvisory.LockManager;
+import com.github.sabomichal.pgadvisory.LockManager.LockHandle;
 import com.github.sabomichal.pgadvisory.LockManager.LockOutcome;
+import com.github.sabomichal.pgadvisory.LockManagerListener;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
 import com.github.sabomichal.pgadvisory.TestPostgres;
+import com.github.sabomichal.pgadvisory.micrometer.MicrometerLockManagerListener;
 import com.github.sabomichal.pgadvisory.r2dbc.R2dbcLockManager;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.Option;
 import org.junit.jupiter.api.Test;
@@ -14,12 +19,17 @@ import org.springframework.boot.context.annotation.ImportCandidates;
 import org.springframework.boot.r2dbc.autoconfigure.ConnectionFactoryOptionsBuilderCustomizer;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcAutoConfiguration;
 import org.springframework.boot.r2dbc.autoconfigure.R2dbcConnectionDetails;
+import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.event.EventListener;
 import reactor.core.publisher.Mono;
 
+import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static com.github.sabomichal.pgadvisory.TestPostgres.await;
 import static com.github.sabomichal.pgadvisory.TestPostgres.execute;
@@ -107,6 +117,59 @@ class PgAdvisoryAutoConfigurationTest {
                 });
     }
 
+    @Test
+    void passesTheApplicationsListeners() {
+        var locked = new CopyOnWriteArrayList<String>();
+        runner.withBean(LockManagerListener.class, () -> new LockManagerListener() {
+                    @Override
+                    public void onLocked(LockHandle handle, Duration lockDuration) {
+                        locked.add(handle.key());
+                    }
+                })
+                .run(context -> {
+                    var key = UUID.randomUUID().toString();
+
+                    lockAndUnlock(context.getBean(LockManager.class), key);
+
+                    assertThat(locked).containsExactly(key);
+                });
+    }
+
+    @Test
+    void publishesEvents() {
+        runner.withUserConfiguration(EventCollector.class).run(context -> {
+            lockAndUnlock(context.getBean(LockManager.class), UUID.randomUUID().toString());
+
+            assertThat(context.getBean(EventCollector.class).events)
+                    .hasExactlyElementsOfTypes(PgAdvisoryEvents.Locked.class, PgAdvisoryEvents.Released.class);
+        });
+    }
+
+    @Test
+    void recordsMetricsWithAMeterRegistry() {
+        runner.withBean(MeterRegistry.class, SimpleMeterRegistry::new).run(context -> {
+            lockAndUnlock(context.getBean(LockManager.class), UUID.randomUUID().toString());
+
+            var registry = context.getBean(MeterRegistry.class);
+            assertThat(registry.get("pg.advisory.lock").tag("outcome", "locked").timer().count()).isEqualTo(1);
+            assertThat(registry.get("pg.advisory.hold").timer().count()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void noMetricsWithoutAMeterRegistry() {
+        runner.run(context -> assertThat(context).hasNotFailed().doesNotHaveBean(MicrometerLockManagerListener.class));
+    }
+
+    @Test
+    void worksWithoutMicrometer() {
+        runner.withClassLoader(new FilteredClassLoader("io.micrometer")).run(context -> {
+            var key = UUID.randomUUID().toString();
+
+            assertThat(lockAndUnlock(context.getBean(LockManager.class), key)).isEqualTo(new LockOutcome.Completed<>(key));
+        });
+    }
+
     @Configuration(proxyBeanMethods = false)
     static class DatabaseConfiguration {
 
@@ -119,6 +182,16 @@ class PgAdvisoryAutoConfigurationTest {
         @Bean
         R2dbcConnectionDetails r2dbcConnectionDetails() {
             return () -> TestPostgres.options("r2dbc:pool:postgresql");
+        }
+    }
+
+    static class EventCollector {
+
+        final List<PgAdvisoryEvents> events = new CopyOnWriteArrayList<>();
+
+        @EventListener
+        void on(PgAdvisoryEvents event) {
+            events.add(event);
         }
     }
 

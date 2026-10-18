@@ -4,6 +4,7 @@ import com.github.sabomichal.pgadvisory.LockFailedException;
 import com.github.sabomichal.pgadvisory.LockManager;
 import com.github.sabomichal.pgadvisory.LockManager.LockHandle;
 import com.github.sabomichal.pgadvisory.LockManager.LockOutcome;
+import com.github.sabomichal.pgadvisory.LockManagerListener;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
 import com.github.sabomichal.pgadvisory.TestPostgres;
 import io.r2dbc.spi.ConnectionFactories;
@@ -22,7 +23,6 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.github.sabomichal.pgadvisory.TestPostgres.await;
 import static com.github.sabomichal.pgadvisory.TestPostgres.terminateConnections;
@@ -141,7 +141,7 @@ class R2dbcLockManagerTest {
 
     @Test
     void unreachableDatabaseFailsWithLockFailedException() {
-        var lockManager = lockManager(ConnectionFactories.get("r2dbc:postgresql://user:password@localhost:1/db"), settings("A"), () -> {});
+        var lockManager = lockManager(ConnectionFactories.get("r2dbc:postgresql://user:password@localhost:1/db"), settings("A"));
         var workRan = new AtomicBoolean();
 
         assertThatThrownBy(() -> await(lockManager.tryWithLock(newKey(), _ -> Mono.fromRunnable(() -> workRan.set(true)))))
@@ -152,19 +152,80 @@ class R2dbcLockManagerTest {
 
     @Test
     void reconnectsWhenTheLockConnectionIsBroken() {
-        var resets = new AtomicInteger();
+        var listener = new RecordingListener();
         var applicationName = "lock-manager-" + UUID.randomUUID();
-        var lockManager = lockManager(settings(applicationName), resets::incrementAndGet);
+        var lockManager = lockManager(settings(applicationName), listener);
         lockAndUnlock(lockManager, newKey());
 
         assertThat(terminateConnections(applicationName)).isEqualTo(1);
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             await(lockManager.validateDbConnection());
-            assertThat(resets).hasValue(1);
+            assertThat(listener.calls).containsOnlyOnce("reset");
         });
 
         var key = newKey();
         assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
+    void listenerSeesLockedBusyAndReleased() {
+        var listenerA = new RecordingListener();
+        var listenerB = new RecordingListener();
+        var a = lockManager(settings("A"), listenerA);
+        var b = lockManager(settings("B"), listenerB);
+        var key = newKey();
+        var holder = hold(a, key);
+
+        lockAndUnlock(a, key);
+        lockAndUnlock(b, key);
+        holder.release();
+
+        assertThat(listenerA.calls).containsExactly("locked " + key, "busy " + key + " here", "released " + key);
+        assertThat(listenerB.calls).containsExactly("busy " + key + " elsewhere");
+    }
+
+    @Test
+    void listenerSeesTheReleaseAfterAFailedWork() {
+        var listener = new RecordingListener();
+        var lockManager = lockManager(settings("A"), listener);
+        var key = newKey();
+
+        assertThatThrownBy(() -> await(lockManager.tryWithLock(key, _ -> Mono.error(new IllegalStateException("work failed")))))
+                .hasMessage("work failed");
+
+        assertThat(listener.calls).containsExactly("locked " + key, "released " + key);
+    }
+
+    @Test
+    void listenerSeesTheFailedLock() {
+        var listener = new RecordingListener();
+        var lockManager = lockManager(ConnectionFactories.get("r2dbc:postgresql://user:password@localhost:1/db"), settings("A"), listener);
+        var key = newKey();
+
+        assertThatThrownBy(() -> await(lockManager.tryWithLock(key, _ -> Mono.just("work")))).isInstanceOf(LockFailedException.class);
+
+        assertThat(listener.calls).containsExactly("failed " + key);
+    }
+
+    @Test
+    void failingListenerDoesNotBreakLocking() {
+        var failing = new LockManagerListener() {
+            @Override
+            public void onLocked(LockHandle handle, Duration lockDuration) {
+                throw new IllegalStateException("listener failed");
+            }
+
+            @Override
+            public void onReleased(LockHandle handle, Duration heldDuration) {
+                throw new IllegalStateException("listener failed");
+            }
+        };
+        var recording = new RecordingListener();
+        var lockManager = lockManager(settings("A"), failing, recording);
+        var key = newKey();
+
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
+        assertThat(recording.calls).containsExactly("locked " + key, "released " + key);
     }
 
     @Test
@@ -217,17 +278,13 @@ class R2dbcLockManagerTest {
 
     // ------------------------------------------------------------------ helpers
 
-    private R2dbcLockManager lockManager(LockManagerSettings.Builder settings) {
-        return lockManager(settings, () -> {});
-    }
-
-    private R2dbcLockManager lockManager(LockManagerSettings.Builder settings, Runnable onConnectionReset) {
-        return lockManager(TestPostgres.connectionFactory(), settings, onConnectionReset);
+    private R2dbcLockManager lockManager(LockManagerSettings.Builder settings, LockManagerListener... listeners) {
+        return lockManager(TestPostgres.connectionFactory(), settings, listeners);
     }
 
     private R2dbcLockManager lockManager(ConnectionFactory connectionFactory, LockManagerSettings.Builder settings,
-                                         Runnable onConnectionReset) {
-        var lockManager = new R2dbcLockManager(connectionFactory, settings.build(), onConnectionReset::run);
+                                         LockManagerListener... listeners) {
+        var lockManager = new R2dbcLockManager(connectionFactory, settings.build(), List.of(listeners));
         lockManagers.add(lockManager);
         return lockManager;
     }
@@ -253,6 +310,37 @@ class R2dbcLockManagerTest {
         void release() {
             releaseSignal.complete(null);
             outcome.join();
+        }
+    }
+
+    /** Records the callbacks as text. */
+    private static class RecordingListener implements LockManagerListener {
+
+        final List<String> calls = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void onLocked(LockHandle handle, Duration lockDuration) {
+            calls.add("locked " + handle.key());
+        }
+
+        @Override
+        public void onBusy(String key, LockOutcome.Busy<?> busy, Duration lockDuration) {
+            calls.add("busy " + key + (busy.sameInstance() ? " here" : " elsewhere"));
+        }
+
+        @Override
+        public void onLockFailed(String key, LockFailedException error, Duration lockDuration) {
+            calls.add("failed " + key);
+        }
+
+        @Override
+        public void onReleased(LockHandle handle, Duration heldDuration) {
+            calls.add("released " + handle.key());
+        }
+
+        @Override
+        public void onConnectionReset() {
+            calls.add("reset");
         }
     }
 

@@ -29,7 +29,7 @@ public record PgAdvisoryProperties(
         @DefaultValue R2dbc r2dbc) {
 
     /**
-     * @param autoCreate Whether to create the lock table on start when it does not exist; otherwise create it with
+     * @param autoCreate Whether to create the lock table on start when it does not exist. Otherwise create it with
      *                   classpath:db/pg-advisory/V1__advisory_lock.sql.
      */
     public record Schema(@DefaultValue("false") boolean autoCreate) {
@@ -48,17 +48,17 @@ public record PgAdvisoryProperties(
     }
 
     /**
-     * Dedicated, unpooled connection of the lock manager. When the URL is not set, it connects with the
-     * application's connection details (spring.r2dbc.*), but never through its pool. The application's
-     * ConnectionFactoryOptionsBuilderCustomizer beans apply either way.
+     * Without a URL the lock connection uses the application's connection details (spring.r2dbc.*), never its pool.
+     * The application's ConnectionFactoryOptionsBuilderCustomizer beans apply either way.
      *
-     * @param url      R2DBC URL of the lock connection; an r2dbc:pool: prefix is ignored.
+     * @param url      R2DBC URL of the lock connection, an r2dbc:pool: prefix is ignored.
      * @param username Login username of the lock connection.
      * @param password Login password of the lock connection.
      */
     public record R2dbc(@Nullable String url, @Nullable String username, @Nullable String password) {
     }
 
+    /** The {@link LockManagerSettings} of these properties. */
     public LockManagerSettings toSettings() {
         return LockManagerSettings.builder()
                 .tableName(tableName)
