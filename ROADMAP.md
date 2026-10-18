@@ -24,22 +24,26 @@ relies on `MonoSink.onCancel` firing only when the cancel wins over the delivery
 is removed only after the unlock. *Classes:* `R2dbcPgAdvisory.withLock/release`, `SerialExecutor`.
 *Tests:* `cancelWhileLockingOnTheSessionReleasesTheLock`, `cancelWhileTakingOverReleasesTheLock`.
 
-## 2. An error after `pg_try_advisory_lock` leaks the lock
+## 2. An error after `pg_try_advisory_lock` leaks the lock (done)
 
 **Problem.** A session advisory lock survives the rollback of the transaction it was taken in. When
 anything fails after `pg_try_advisory_lock` succeeded (e.g. the `COMMIT`), the rollback keeps the lock
 and `doOnError` removes the in-memory entry. The next `tryWithLock` of the key on this instance gets
-the lock a second time (reentrant) and its single unlock leaves it held.
+the lock a second time (reentrant) and its single unlock leaves it held, and other instances find the
+key busy.
 
-**Solution.** Take the advisory lock in autocommit, outside of any transaction, and release it after
-a failed transaction has rolled back. If the unlock fails too, discard the lock connection.
-*Tests:* `failedRecordWriterReleasesTheLock`.
+**Done.** The advisory lock is taken in autocommit, outside of any transaction, so nothing can fail
+after it. The transaction protected nothing, `INSERT … ON CONFLICT DO NOTHING` is atomic on its own.
+Releasing the lock after a failed transaction comes back with the `LockRecordWriter` of step 10.
+*Test:* `failingCommitDoesNotLeakTheLock`, on a key whose row exists. For a new key the rollback also
+removed the row, so the next lock got a new id and the leaked lock stayed hidden.
 
-It also speeds locking up. The transaction protects nothing here, `INSERT … ON CONFLICT DO NOTHING` is
-atomic on its own, and a lock/unlock cycle drops from 5 round trips (`BEGIN`, `INSERT`,
+It also speeds locking up: a lock/unlock cycle drops from 5 round trips (`BEGIN`, `INSERT`,
 `pg_try_advisory_lock`, `COMMIT`, `pg_advisory_unlock`) to 3. Since step 4 a cycle costs almost only its
-round trips, ~4.3 ms for 5 on Docker Desktop for Windows. The estimate is ~2.6 ms per cycle and ~390
-instead of ~235 cycles per second, to be verified with `R2dbcLockManagerBenchmark`.
+round trips. Measured with `R2dbcLockManagerBenchmark` on Docker Desktop for Windows: 235 / 233 / 237 →
+390 / 371 / 383 cycles per second at 1 / 16 / 256 at once, latency of a single caller 4.3 → 2.6 ms
+(p50), with 256 callers 1021 → 653 ms. `locksManyKeysInTime` 5.5 s → 3.8 s, less than 5/3 faster,
+because its keys are new and the `INSERT` now carries the cost of the commit.
 
 ## 3. Completion order of cleanups (done with step 4)
 
@@ -169,6 +173,10 @@ so its token is only in the `LockHandle`.
 An `owner` column, a `LockRecordWriter` for extra columns and a lookup of the holder of a key (in the
 original code the lock record held an RPC endpoint for routing requests to the holder).
 *Tests:* `directKeyMapperCollisionOnlyContends`, `directKeyMapperCollisionIsHeldLocallyWithinOneInstance`.
+
+The `LockRecordWriter` brings a transaction after the lock back (step 2 removed the one around it). The
+lock is released after the rollback of a failed transaction, and when the unlock fails too, the lock
+connection is discarded. *Test:* `failedRecordWriterReleasesTheLock`.
 
 ## 11. Observability (partly done)
 

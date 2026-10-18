@@ -160,13 +160,12 @@ All under `pg-advisory`.
 
 1. **In memory**, so that the same instance cannot lock it again: session advisory locks are
    reentrant on the one lock connection. A key held here is `Busy(sameInstance = true)`.
-2. **In PostgreSQL**, on the shared lock connection:
+2. **In PostgreSQL**, on the shared lock connection, in autocommit:
    ```sql
-   BEGIN;
    INSERT INTO advisory_lock (lock_key) VALUES (:key) ON CONFLICT (lock_key) DO NOTHING;
    SELECT pg_try_advisory_lock(id) FROM advisory_lock WHERE lock_key = :key;  -- false → Busy(sameInstance = false)
-   COMMIT;
    ```
+   Not in a transaction: a session advisory lock would survive its rollback anyway.
 
 Then `work` runs, and the lock is released with `pg_advisory_unlock`. The lock connection serves
 one operation at a time, the others wait in a FIFO queue.

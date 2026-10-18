@@ -4,7 +4,6 @@ import com.github.sabomichal.pgadvisory.LockFailedException;
 import com.github.sabomichal.pgadvisory.LockManager;
 import com.github.sabomichal.pgadvisory.LockManagerListener;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
-import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.R2dbcNonTransientResourceException;
 import io.r2dbc.spi.ValidationDepth;
@@ -125,20 +124,14 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
             notifyListeners(listener -> listener.onBusy(key, new LockOutcome.Busy<>(true), since(started)));
             return Mono.just(new LockAcquisition.Busy(true));
         }
+        // in auto-commit mode without a transaction - a session advisory lock would survive the rollback of a transaction anyway
         return executor.submit(() -> connectionFactory.create()
-                .flatMap(connection -> Mono.from(connection.beginTransaction())
-                        .then(dao.createLockRecord(connection, key))
+                .flatMap(connection -> dao.createLockRecord(connection, key)
                         .doOnNext(rowsUpdated -> log.trace(rowsUpdated > 0
                                 ? "[{}] Lock record created key=[{}]"
                                 : "[{}] Lock record exists key=[{}]", settings.applicationName(), key))
-                        .then(dao.lock(connection, key))
-                        .flatMap(locked -> locked
-                                ? commitLocked(connection, key, started)
-                                : rollbackBusy(connection, key, started))
-                        .onErrorResume(error -> {
-                            log.trace("[{}] Rollback key=[{}]", settings.applicationName(), key);
-                            return Mono.from(connection.rollbackTransaction()).then(Mono.error(error));
-                        }))
+                        .then(dao.lock(connection, key)))
+                .map(acquired -> acquired ? locked(key, started) : busy(key, started))
                 .doOnError(error -> {
                     currentlyProcessingLocks.remove(key);
                     log.debug("[{}] Lock failed key=[{}]", settings.applicationName(), key, error);
@@ -148,26 +141,18 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                         error -> notifyListeners(listener -> listener.onLockFailed(key, error, since(started)))));
     }
 
-    private Mono<LockAcquisition> commitLocked(Connection connection, String key, long started) {
-        log.trace("[{}] Commit key=[{}]", settings.applicationName(), key);
-        return Mono.from(connection.commitTransaction())
-                .then(Mono.fromSupplier(() -> {
-                    var locked = new LockAcquisition.Locked(new DefaultLockHandle(key), System.nanoTime());
-                    log.debug("[{}] Locked key=[{}]", settings.applicationName(), key);
-                    notifyListeners(listener -> listener.onLocked(locked.handle(), Duration.ofNanos(locked.lockedNanos() - started)));
-                    return locked;
-                }));
+    private LockAcquisition locked(String key, long started) {
+        var locked = new LockAcquisition.Locked(new DefaultLockHandle(key), System.nanoTime());
+        log.debug("[{}] Locked key=[{}]", settings.applicationName(), key);
+        notifyListeners(listener -> listener.onLocked(locked.handle(), Duration.ofNanos(locked.lockedNanos() - started)));
+        return locked;
     }
 
-    private Mono<LockAcquisition> rollbackBusy(Connection connection, String key, long started) {
-        log.trace("[{}] Rollback key=[{}]", settings.applicationName(), key);
-        return Mono.from(connection.rollbackTransaction())
-                .<LockAcquisition>thenReturn(new LockAcquisition.Busy(false))
-                .doOnNext(_ -> {
-                    currentlyProcessingLocks.remove(key);
-                    log.debug("[{}] Busy key=[{}], held by another instance", settings.applicationName(), key);
-                    notifyListeners(listener -> listener.onBusy(key, new LockOutcome.Busy<>(false), since(started)));
-                });
+    private LockAcquisition busy(String key, long started) {
+        currentlyProcessingLocks.remove(key);
+        log.debug("[{}] Busy key=[{}], held by another instance", settings.applicationName(), key);
+        notifyListeners(listener -> listener.onBusy(key, new LockOutcome.Busy<>(false), since(started)));
+        return new LockAcquisition.Busy(false);
     }
 
     private Mono<String> unlockInternal(LockAcquisition.Locked locked) {

@@ -7,9 +7,11 @@ import com.github.sabomichal.pgadvisory.LockManager.LockOutcome;
 import com.github.sabomichal.pgadvisory.LockManagerListener;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
 import com.github.sabomichal.pgadvisory.TestPostgres;
+import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactories;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.R2dbcNonTransientResourceException;
+import io.r2dbc.spi.R2dbcTransientResourceException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -18,6 +20,7 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.lang.reflect.Proxy;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -168,6 +171,20 @@ class R2dbcLockManagerTest {
     }
 
     @Test
+    void failingCommitDoesNotLeakTheLock() {
+        var a = lockManager(failingCommits(TestPostgres.connectionFactory()), settings("A"));
+        var b = lockManager(settings("B"));
+        var key = newKey();
+        // the key's row exists, otherwise a rollback would remove it and the next lock would get a new id
+        lockAndUnlock(b, key);
+
+        // a session advisory lock survives the rollback of the transaction it was taken in
+        await(a.tryWithLock(key, handle -> Mono.just(handle.key())).onErrorResume(LockFailedException.class, _ -> Mono.empty()));
+
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
     void reconnectsWhenTheLockConnectionIsBroken() {
         var listener = new RecordingListener();
         var applicationName = "lock-manager-" + UUID.randomUUID();
@@ -293,7 +310,7 @@ class R2dbcLockManagerTest {
         log.info("{} lock/unlock cycles in {} ms ({}/s)", keys.size(), elapsed.toMillis(),
                 keys.size() * 1000L / Math.max(1, elapsed.toMillis()));
         assertThat(outcomes).containsExactlyInAnyOrderElementsOf(completed(keys));
-        // the polled mutex of the lock connection took 32 s, the queue takes 5.5 s on Docker Desktop for Windows
+        // the polled mutex of the lock connection took 32 s, now it takes 3.8 s on Docker Desktop for Windows
         assertThat(elapsed).isLessThan(Duration.ofSeconds(15));
     }
 
@@ -388,6 +405,21 @@ class R2dbcLockManagerTest {
         public void onConnectionReset() {
             calls.add("reset");
         }
+    }
+
+    /** Its connections fail every COMMIT, transiently, so that the lock connection is not re-created. */
+    private static ConnectionFactory failingCommits(ConnectionFactory target) {
+        return (ConnectionFactory) Proxy.newProxyInstance(ConnectionFactory.class.getClassLoader(), new Class<?>[]{ConnectionFactory.class},
+                (_, method, args) -> method.getName().equals("create")
+                        ? Mono.<Connection>from(target.create()).map(R2dbcLockManagerTest::failingCommit)
+                        : method.invoke(target, args));
+    }
+
+    private static Connection failingCommit(Connection target) {
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
+                (_, method, args) -> method.getName().equals("commitTransaction")
+                        ? Mono.error(new R2dbcTransientResourceException("commit failed"))
+                        : method.invoke(target, args));
     }
 
     private static String newKey() {
