@@ -137,6 +137,17 @@ class R2dbcLockManagerTest {
     }
 
     @Test
+    void theSameKeyCanBeLockedRightAfterTheRelease() {
+        var lockManager = lockManager(settings("A"));
+        var key = newKey();
+
+        var outcomes = await(lockManager.tryWithLock(key, _ -> Mono.just("first"))
+                .flatMap(first -> lockManager.tryWithLock(key, _ -> Mono.just("second")).map(second -> List.of(first, second))));
+
+        assertThat(outcomes).containsExactly(new LockOutcome.Completed<>("first"), new LockOutcome.Completed<>("second"));
+    }
+
+    @Test
     void emptyWorkCompletesEmptyAndUnlocks() {
         var lockManager = lockManager(settings("A"));
         var key = newKey();
@@ -282,7 +293,8 @@ class R2dbcLockManagerTest {
         log.info("{} lock/unlock cycles in {} ms ({}/s)", keys.size(), elapsed.toMillis(),
                 keys.size() * 1000L / Math.max(1, elapsed.toMillis()));
         assertThat(outcomes).containsExactlyInAnyOrderElementsOf(completed(keys));
-        assertThat(elapsed).isLessThan(Duration.ofSeconds(120));
+        // the polled mutex of the lock connection took 32 s, the queue takes 5.5 s on Docker Desktop for Windows
+        assertThat(elapsed).isLessThan(Duration.ofSeconds(15));
     }
 
     @Test
@@ -325,8 +337,7 @@ class R2dbcLockManagerTest {
     }
 
     private static LockManagerSettings.Builder settings(String applicationName) {
-        // like the original LockManagerTest
-        return LockManagerSettings.builder().applicationName(applicationName).retryMaxBackoff(Duration.ofMillis(1000));
+        return LockManagerSettings.builder().applicationName(applicationName);
     }
 
     /** Holds the lock of {@code key} until {@link Holder#release()}. */

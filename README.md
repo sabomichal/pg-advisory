@@ -151,10 +151,7 @@ All under `pg-advisory`.
 | `table-name`                            | `advisory_lock`      | Lock table, optionally schema qualified.                                  |
 | `application-name`                      | `pg-advisory`        | `application_name` of the lock connection, visible in `pg_stat_activity`. |
 | `schema.auto-create`                    | `false`              | Creates the lock table on start when it does not exist.                   |
-| `retry.max-attempts`                    | `100`                | How often an operation retries to get the lock connection.                |
-| `retry.min-backoff` / `max-backoff`     | `10ms` / `500ms`     | Delays between the retries.                                               |
-| `retry.jitter`                          | `0.5`                | Jitter factor of the delays.                                              |
-| `shutdown-lock-timeout`                 | `30s`                | How long closing the lock manager waits for the lock connection.          |
+| `shutdown-lock-timeout`                 | `30s`                | How long closing waits for the queued operations, then it closes anyway.  |
 | `r2dbc.url` / `username` / `password`   | *(`spring.r2dbc.*`)* | Dedicated, unpooled lock connection.                                      |
 
 ## How it works
@@ -172,16 +169,15 @@ All under `pg-advisory`.
    ```
 
 Then `work` runs, and the lock is released with `pg_advisory_unlock`. The lock connection serves
-one operation at a time; others wait with backoff (`retry.*`).
+one operation at a time, the others wait in a FIFO queue.
 
 ## Limitations
 
 - **No fencing.** When the lock connection dies, PostgreSQL releases its locks and another instance
   can take over, while work of this instance may still be running and committing. Only
   `validateDbConnection` notices it, and then calls `LockManagerListener.onConnectionReset`.
-- Known weaknesses of the current implementation, e.g. cancelling during locking or the retry
-  limit of the lock connection under load, and how they are going to be fixed step by step:
-  see [ROADMAP.md](ROADMAP.md).
+- Known weaknesses of the current implementation, e.g. cancelling during locking, and how they are
+  going to be fixed step by step: see [ROADMAP.md](ROADMAP.md).
 - The lock connection must reach PostgreSQL directly or through a pooler in session mode, and must
   not come from a pool.
 

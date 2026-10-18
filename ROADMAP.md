@@ -12,11 +12,11 @@ then fencing, then convenience.
 ## 1. Cancelling while locking leaks the lock
 
 **Problem.** `lock()` runs `BEGIN`, `INSERT`, `pg_try_advisory_lock`, `COMMIT` on the shared lock
-connection. When the caller cancels in between (a timeout, a disconnected client), the chain stops:
-`onErrorResume` (rollback) does not run on cancel, so the shared connection can stay inside an open
-transaction, the session advisory lock may stay held, and `doOnError` does not remove the in-memory
-entry, so the key is `Busy(sameInstance = true)` forever. `usingWhen` never got the resource, so it
-unlocks nothing.
+connection. Since step 4 it runs to its end even when the caller cancels in between (a timeout, a
+disconnected client), so the connection no longer stays inside an open transaction. But the lock taken
+for a caller that left is never released: `usingWhen` never got the resource, so it unlocks nothing,
+the session advisory lock stays held and the in-memory entry keeps the key `Busy(sameInstance = true)`
+forever.
 
 **Solution.** The lock is the resource of `Mono.usingWhen`; a result that arrives after the caller
 left is handed to a callback that releases it (`SerialExecutor.submit(task, onAbandoned)`, which
@@ -35,26 +35,43 @@ the lock a second time (reentrant) and its single unlock leaves it held.
 a failed transaction has rolled back. If the unlock fails too, discard the lock connection.
 *Tests:* `failedRecordWriterReleasesTheLock`.
 
-## 3. Completion order of cleanups
+It also speeds locking up. The transaction protects nothing here, `INSERT … ON CONFLICT DO NOTHING` is
+atomic on its own, and a lock/unlock cycle drops from 5 round trips (`BEGIN`, `INSERT`,
+`pg_try_advisory_lock`, `COMMIT`, `pg_advisory_unlock`) to 3. Since step 4 a cycle costs almost only its
+round trips, ~4.3 ms for 5 on Docker Desktop for Windows. The estimate is ~2.6 ms per cycle and ~390
+instead of ~235 cycles per second, to be verified with `R2dbcLockManagerBenchmark`.
+
+## 3. Completion order of cleanups (done with step 4)
 
 **Problem.** The mutex of the lock connection is released in `doFinally`, i.e. after the result was
 delivered: an operation started right after the completion finds it busy and waits a backoff. On
 `full-implementation` the same pattern made a lock taken right after the release fail with
 `HeldLocally` (here `Busy(sameInstance = true)`), and `stop().then(start())` fail on `STOPPING`.
 
-**Solution.** State changes that the caller must see belong in `doOnTerminate`, before the terminal
-signal. *Tests:* `theSameKeyCanBeLockedRightAfterTheRelease`, `startRightAfterStop`.
+**Done.** The mutex is gone with step 4, the next operation waits in the queue and starts right after
+the previous one. The local entry is removed in `doOnSuccess`, before the result is delivered, so the
+`HeldLocally` problem never applied here. *Test:* `theSameKeyCanBeLockedRightAfterTheRelease`.
+`startRightAfterStop` comes with the lifecycle of step 8, where state changes belong in `doOnTerminate`.
 
-## 4. The lock connection is a polled mutex
+## 4. The lock connection is a polled mutex (done)
 
 **Problem.** Every operation polls `StampedLock.tryLock()` with backoff. Under load it gives up after
 `retry.max-attempts`: locking fails with `LockFailedException`, the other operations with
 `IllegalStateException("LockManager was unable to obtain lock")`. And the backoff costs throughput:
 1 000 concurrent locks take about 30 s in `locksManyKeysInTime`.
 
-**Solution.** A FIFO queue of operations on the lock connection, one at a time, without polling and
+**Done.** A FIFO queue of operations on the lock connection, one at a time, without polling and
 without a retry limit: `SerialExecutor` (`Sinks.many().unicast()` + `concatMap`). An operation runs to
-completion even if its caller cancels (see step 1). The `retry.*` settings go away.
+its end even if its caller cancels, releasing the lock of a caller that left comes with step 1. The
+`retry.*` settings are gone. `close()` waits up to `shutdown-lock-timeout` for the queued operations
+and then closes the lock connection anyway, instead of throwing and leaving it open.
+
+Measured with `R2dbcLockManagerBenchmark` on Docker Desktop for Windows: 26 / 30 / 58 → 235 / 233 / 237
+lock/unlock cycles per second at 1 / 16 / 256 at once, mean latency of a single caller 31 → 4.5 ms. With
+256 callers the old code failed with `unable to obtain lock`, the queue serves each in about 1 s
+(256 × 4 ms). `locksManyKeysInTime` 32.5 s → 5.5 s. What is left is the cost of 5 round trips per cycle
+on one connection, step 2 removes two of them. *Tests:* `SerialExecutorTest`, `locksManyKeysInTime`
+(bound 15 s), `contendedKeysAreNeverHeldTwice`, `theSameKeyCanBeLockedRightAfterTheRelease`.
 
 ## 5. A lost lock connection goes unnoticed
 
