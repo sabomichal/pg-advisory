@@ -4,6 +4,7 @@ import com.github.sabomichal.pgadvisory.LockFailedException;
 import com.github.sabomichal.pgadvisory.LockManager;
 import com.github.sabomichal.pgadvisory.LockManagerListener;
 import com.github.sabomichal.pgadvisory.LockManagerSettings;
+import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.R2dbcNonTransientResourceException;
 import io.r2dbc.spi.ValidationDepth;
@@ -25,8 +26,8 @@ import java.util.function.Function;
  * A key is locked in two places: in memory, so that the same instance cannot lock it twice (session advisory locks
  * are reentrant), and in PostgreSQL by {@code pg_try_advisory_lock} on the id of the key's row in the lock table.
  * <p>
- * A heartbeat runs {@link #validateDbConnection()} every {@link LockManagerSettings#heartbeatInterval()}, so that a lock
- * connection lost while idle is noticed and re-created.
+ * A heartbeat checks the lock connection every {@link LockManagerSettings#heartbeatInterval()} and resets a broken one,
+ * so that a lock connection lost while idle is noticed and re-created.
  */
 public final class R2dbcLockManager implements LockManager, AutoCloseable {
 
@@ -85,7 +86,11 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
 
     @Override
     public <T> Mono<LockOutcome<T>> tryWithLock(String key, Function<LockHandle, Mono<T>> work) {
-        return tryWithLock(key, _ -> {}, _ -> {}, work);
+        return tryWithLock(
+                key, _ -> {
+                }, _ -> {
+                }, work
+        );
     }
 
     @Override
@@ -102,23 +107,28 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                             case LockAcquisition.Busy(var sameInstance) -> Mono.just(new LockOutcome.Busy<T>(sameInstance));
                         },
                         lockAcquisition -> lockAcquisition instanceof LockAcquisition.Locked locked ? unlockInternal(locked) : Mono.empty())
-                .doOnError(this::validateConnectionOnError);
+                .doOnError(this::checkConnectionOnError);
     }
 
-    @Override
-    public Mono<Void> validateDbConnection() {
+    /**
+     * Validates the lock connection and replaces a broken one, closing it drops all its locks. Run by the heartbeat and
+     * after a non-transient error.
+     */
+    Mono<Void> checkAndResetConnection() {
         return executor.submit(() -> connectionFactory.create()
                 // an unanswered validation counts as broken, it would hold up the queue of the lock connection
                 .flatMap(connection -> Mono.from(connection.validate(ValidationDepth.REMOTE))
                         .timeout(settings.heartbeatTimeout(), Mono.just(false)))
                 .flatMap(valid -> valid ? Mono.<Void>empty() : Mono.error(new DbConnectionValidationException()))
-                .doOnError(R2dbcNonTransientResourceException.class, _ -> reinitDbConnection())
-                .doOnError(DbConnectionValidationException.class, _ -> reinitDbConnection())
+                .doOnError(R2dbcNonTransientResourceException.class, _ -> resetConnection())
+                .doOnError(DbConnectionValidationException.class, _ -> resetConnection())
                 .onErrorResume(R2dbcNonTransientResourceException.class, _ -> Mono.empty())
                 .onErrorResume(DbConnectionValidationException.class, _ -> Mono.empty()));
     }
 
-    /** Verifies the lock table, creates a missing one when {@link LockManagerSettings#autoCreateSchema()}. */
+    /**
+     * Verifies the lock table, creates a missing one when {@link LockManagerSettings#autoCreateSchema()}.
+     */
     public Mono<Void> ensureTable() {
         return executor.submit(() -> connectionFactory.create()
                 .flatMap(connection -> dao.ensureTable(connection, settings.autoCreateSchema())));
@@ -131,14 +141,16 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
             notifyListeners(listener -> listener.onBusy(key, new LockOutcome.Busy<>(true), since(started)));
             return Mono.just(new LockAcquisition.Busy(true));
         }
-        // in auto-commit mode without a transaction - a session advisory lock would survive the rollback of a transaction anyway
+        // no transaction: a failed COMMIT would roll back the INSERT but keep the session advisory lock, which would then leak
+        // until the shared lock connection closes. The single INSERT is atomic on its own, so a transaction would protect nothing.
         return executor.submit(() -> connectionFactory.create()
                         .flatMap(connection -> dao.createLockRecord(connection, key)
-                                .doOnNext(rowsUpdated -> log.trace(rowsUpdated > 0
-                                        ? "[{}] Lock record created key=[{}]"
-                                        : "[{}] Lock record exists key=[{}]", settings.applicationName(), key))
-                                .then(dao.lock(connection, key)))
-                        .map(acquired -> acquired ? locked(key, started) : busy(key, started))
+                                .doOnNext(rowsUpdated ->
+                                        log.trace(rowsUpdated > 0 ? "[{}] Lock record created key=[{}]" : "[{}] Lock record exists key=[{}]", settings.applicationName(), key))
+                                .then(dao.lock(connection, key))
+                                .flatMap(acquired -> acquired
+                                        ? nextFencingToken(connection, key).map(token -> locked(key, token, started))
+                                        : Mono.just(busy(key, started))))
                         .doOnError(error -> {
                             currentlyProcessingLocks.remove(key);
                             log.debug("[{}] Lock failed key=[{}]", settings.applicationName(), key, error);
@@ -154,13 +166,21 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         if (acquisition instanceof LockAcquisition.Locked locked) {
             log.debug("[{}] Releasing key=[{}], caller cancelled before receiving lock",
                     settings.applicationName(), locked.handle().key());
-            unlockInternal(locked).subscribe(null, this::validateConnectionOnError);
+            unlockInternal(locked).subscribe(null, this::checkConnectionOnError);
         }
     }
 
-    private LockAcquisition locked(String key, long started) {
-        var locked = new LockAcquisition.Locked(new DefaultLockHandle(key), System.nanoTime());
-        log.debug("[{}] Locked key=[{}]", settings.applicationName(), key);
+    private Mono<Long> nextFencingToken(Connection connection, String key) {
+        return dao.nextFencingToken(connection, key)
+                .onErrorResume(error -> dao.unlock(connection, key)
+                        .doOnError(_ -> resetConnection())
+                        .onErrorComplete()
+                        .then(Mono.error(error)));
+    }
+
+    private LockAcquisition locked(String key, long fencingToken, long started) {
+        var locked = new LockAcquisition.Locked(new DefaultLockHandle(key, fencingToken), System.nanoTime());
+        log.debug("[{}] Locked key=[{}] fencingToken=[{}]", settings.applicationName(), key, fencingToken);
         notifyListeners(listener -> listener.onLocked(locked.handle(), Duration.ofNanos(locked.lockedNanos() - started)));
         return locked;
     }
@@ -192,7 +212,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
     }
 
     private Disposable startHeartbeat() {
-        return validateDbConnection()
+        return checkAndResetConnection()
                 .doOnError(error -> log.warn("[{}] Heartbeat of the lock connection failed", settings.applicationName(), error))
                 .onErrorComplete()
                 .delaySubscription(settings.heartbeatInterval())
@@ -200,13 +220,13 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                 .subscribe();
     }
 
-    private void validateConnectionOnError(Throwable error) {
+    private void checkConnectionOnError(Throwable error) {
         if (rootCause(error) instanceof R2dbcNonTransientResourceException) {
-            validateDbConnection().subscribe();
+            checkAndResetConnection().subscribe();
         }
     }
 
-    private void reinitDbConnection() {
+    private void resetConnection() {
         log.warn("[{}] Lock connection is broken, re-creating it, all its locks are lost", settings.applicationName());
         notifyListeners(LockManagerListener::onConnectionReset);
         connectionFactory.destroy().subscribe();
@@ -241,10 +261,14 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         return cause;
     }
 
-    /** What {@link #lock} got: the lock, or a key locked by this or another instance. */
+    /**
+     * What {@link #lock} got: the lock, or a key locked by this or another instance.
+     */
     private sealed interface LockAcquisition {
 
-        /** {@code lockedNanos} by {@link System#nanoTime()}, for the hold time. */
+        /**
+         * {@code lockedNanos} by {@link System#nanoTime()}, for the hold time.
+         */
         record Locked(LockHandle handle, long lockedNanos) implements LockAcquisition {
         }
 
@@ -252,7 +276,9 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         }
     }
 
-    /** The lock connection failed its validation. */
-    public static class DbConnectionValidationException extends RuntimeException {
+    /**
+     * The lock connection failed its validation.
+     */
+    private static class DbConnectionValidationException extends RuntimeException {
     }
 }

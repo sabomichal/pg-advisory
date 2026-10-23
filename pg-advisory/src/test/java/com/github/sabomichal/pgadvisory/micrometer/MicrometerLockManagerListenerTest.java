@@ -16,7 +16,7 @@ class MicrometerLockManagerListenerTest {
 
     private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
     private final MicrometerLockManagerListener listener = new MicrometerLockManagerListener(registry);
-    private final LockHandle handle = () -> "key";
+    private final LockHandle handle = new Handle("key", 1);
 
     @Test
     void recordsTheLockTimeByOutcome() {
@@ -60,5 +60,8 @@ class MicrometerLockManagerListenerTest {
 
     private Timer lockTimer(String outcome) {
         return registry.get("pg.advisory.lock").tag("outcome", outcome).timer();
+    }
+
+    private record Handle(String key, long fencingToken) implements LockHandle {
     }
 }

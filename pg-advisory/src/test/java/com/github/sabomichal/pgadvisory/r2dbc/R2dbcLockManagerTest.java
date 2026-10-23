@@ -1,17 +1,9 @@
 package com.github.sabomichal.pgadvisory.r2dbc;
 
-import com.github.sabomichal.pgadvisory.LockFailedException;
-import com.github.sabomichal.pgadvisory.LockManager;
+import com.github.sabomichal.pgadvisory.*;
 import com.github.sabomichal.pgadvisory.LockManager.LockHandle;
 import com.github.sabomichal.pgadvisory.LockManager.LockOutcome;
-import com.github.sabomichal.pgadvisory.LockManagerListener;
-import com.github.sabomichal.pgadvisory.LockManagerSettings;
-import com.github.sabomichal.pgadvisory.TestPostgres;
-import io.r2dbc.spi.Connection;
-import io.r2dbc.spi.ConnectionFactories;
-import io.r2dbc.spi.ConnectionFactory;
-import io.r2dbc.spi.R2dbcNonTransientResourceException;
-import io.r2dbc.spi.R2dbcTransientResourceException;
+import io.r2dbc.spi.*;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -214,7 +206,7 @@ class R2dbcLockManagerTest {
 
         assertThat(terminateConnections(applicationName)).isEqualTo(1);
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            await(lockManager.validateDbConnection());
+            await(lockManager.checkAndResetConnection());
             assertThat(listener.calls).containsOnlyOnce("reset");
         });
 
@@ -345,6 +337,32 @@ class R2dbcLockManagerTest {
     }
 
     @Test
+    void fencingTokenGrowsWithEveryLockOfTheKey() {
+        var a = lockManager(settings("A"));
+        var b = lockManager(settings("B"));
+        var key = newKey();
+
+        var tokens = List.of(a, b, a).stream()
+                .map(lockManager -> await(lockManager.tryWithLock(key, handle -> Mono.just(handle.fencingToken()))))
+                .toList();
+
+        assertThat(tokens).containsExactly(new LockOutcome.Completed<>(1L), new LockOutcome.Completed<>(2L), new LockOutcome.Completed<>(3L));
+    }
+
+    @Test
+    void failedFencingTokenReleasesTheLock() {
+        var a = lockManager(failingFirstStatement(TestPostgres.connectionFactory(), "fencing_token + 1"), settings("A"));
+        var b = lockManager(settings("B"));
+        var key = newKey();
+
+        // the token is issued after pg_try_advisory_lock, whose session lock survives the failed statement
+        assertThatThrownBy(() -> lockAndUnlock(a, key)).isInstanceOf(LockFailedException.class);
+
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
+        assertThat(lockAndUnlock(a, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
     void locksManyKeysInTime() {
         var lockManager = lockManager(settings("A"));
         var keys = Flux.range(0, 1000).map(_ -> newKey()).collectList().block();
@@ -456,7 +474,6 @@ class R2dbcLockManagerTest {
         }
     }
 
-    /** Its connections fail every COMMIT, transiently, so that the lock connection is not re-created. */
     private static ConnectionFactory failingCommits(ConnectionFactory target) {
         return (ConnectionFactory) Proxy.newProxyInstance(ConnectionFactory.class.getClassLoader(), new Class<?>[]{ConnectionFactory.class},
                 (_, method, args) -> method.getName().equals("create")
@@ -471,7 +488,28 @@ class R2dbcLockManagerTest {
                         : method.invoke(target, args));
     }
 
-    /** The validation of its first connection never answers, like a connection to an unreachable server. */
+    private static ConnectionFactory failingFirstStatement(ConnectionFactory target, String sql) {
+        var failed = new AtomicBoolean();
+        return (ConnectionFactory) Proxy.newProxyInstance(ConnectionFactory.class.getClassLoader(), new Class<?>[]{ConnectionFactory.class},
+                (_, method, args) -> method.getName().equals("create")
+                        ? Mono.<Connection>from(target.create()).map(connection -> failingStatement(connection, sql, failed))
+                        : method.invoke(target, args));
+    }
+
+    private static Connection failingStatement(Connection target, String sql, AtomicBoolean failed) {
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
+                (_, method, args) -> method.getName().equals("createStatement") && ((String) args[0]).contains(sql) && failed.compareAndSet(false, true)
+                        ? failingExecution()
+                        : method.invoke(target, args));
+    }
+
+    private static Statement failingExecution() {
+        return (Statement) Proxy.newProxyInstance(Statement.class.getClassLoader(), new Class<?>[]{Statement.class},
+                (proxy, method, _) -> method.getName().equals("execute")
+                        ? Flux.error(new R2dbcTransientResourceException("statement failed"))
+                        : proxy);
+    }
+
     private static ConnectionFactory hangingFirstValidation(ConnectionFactory target) {
         var first = new AtomicBoolean(true);
         return (ConnectionFactory) Proxy.newProxyInstance(ConnectionFactory.class.getClassLoader(), new Class<?>[]{ConnectionFactory.class},
@@ -495,7 +533,6 @@ class R2dbcLockManagerTest {
         return keys.stream().<LockOutcome<String>>map(LockOutcome.Completed::new).toList();
     }
 
-    /** Locks {@code key}, returns it from the locked work and unlocks. */
     private static LockOutcome<String> lockAndUnlock(LockManager lockManager, String key) {
         return await(lockManager.tryWithLock(key, handle -> Mono.just(handle.key())));
     }

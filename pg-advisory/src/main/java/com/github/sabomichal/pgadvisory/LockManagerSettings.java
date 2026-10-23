@@ -13,8 +13,7 @@ import java.util.regex.Pattern;
  * @param shutdownLockTimeout how long closing the lock manager waits for the queued operations, then it closes the
  *                            lock connection anyway
  * @param heartbeatInterval   how often the lock connection is validated, a broken one is re-created
- * @param heartbeatTimeout    how long a validation may take, also by {@link LockManager#validateDbConnection()}, then
- *                            the lock connection counts as broken
+ * @param heartbeatTimeout    how long a validation of the lock connection may take, then it counts as broken
  */
 public record LockManagerSettings(
         String tableName,

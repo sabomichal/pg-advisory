@@ -21,9 +21,6 @@ public interface LockManager {
             String key, Consumer<LockHandle> onLock, Consumer<LockHandle> onFinally, Function<LockHandle, Mono<T>> work
     );
 
-    /** Checks the lock connection and re-creates it when broken, which drops all its locks. */
-    Mono<Void> validateDbConnection();
-
     /** Result of {@link #tryWithLock}. */
     sealed interface LockOutcome<T> {
 
@@ -49,5 +46,11 @@ public interface LockManager {
 
         /** The key passed to {@link #tryWithLock}. */
         String key();
+
+        /**
+         * Fencing token of this lock, higher than the token of every earlier lock of the key, by any instance. Pass it
+         * along with writes, so that their target rejects writes with an older token of the key.
+         */
+        long fencingToken();
     }
 }

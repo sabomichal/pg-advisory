@@ -6,9 +6,12 @@ import io.r2dbc.spi.Result;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.util.Objects;
 import java.util.function.Function;
 
-/** SQL of the lock table: one row per key, whose {@code id} is the advisory lock id. */
+/**
+ * SQL of the lock table: one row per key, whose {@code id} is the advisory lock id.
+ */
 final class AdvisoryLockDao {
 
     private static final String TABLE_EXISTS = """
@@ -16,8 +19,9 @@ final class AdvisoryLockDao {
 
     private static final String CREATE_TABLE = """
             CREATE TABLE IF NOT EXISTS %s (
-                id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                lock_key text   NOT NULL UNIQUE
+                id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                lock_key      text   NOT NULL UNIQUE,
+                fencing_token bigint NOT NULL DEFAULT 0
             )""";
 
     private static final String SET_APPLICATION_NAME = """
@@ -38,6 +42,12 @@ final class AdvisoryLockDao {
             FROM %s
             WHERE lock_key = $1""";
 
+    private static final String NEXT_FENCING_TOKEN = """
+            UPDATE %s
+            SET fencing_token = fencing_token + 1
+            WHERE lock_key = $1
+            RETURNING fencing_token""";
+
     private final String tableName;
 
     AdvisoryLockDao(String tableName) {
@@ -45,7 +55,7 @@ final class AdvisoryLockDao {
     }
 
     Mono<Void> ensureTable(Connection connection, boolean autoCreate) {
-        return queryOne(connection, TABLE_EXISTS, row -> row.get(0, Boolean.class), tableName)
+        return queryOne(connection, TABLE_EXISTS, row -> Objects.requireNonNull(row.get(0, Boolean.class)), tableName)
                 .flatMap(exists -> {
                     if (exists) {
                         return Mono.empty();
@@ -55,9 +65,7 @@ final class AdvisoryLockDao {
                                 + "(see classpath:db/pg-advisory/V1__advisory_lock.sql) or enable pg-advisory.schema.auto-create")
                                 .formatted(tableName)));
                     }
-                    return Flux.from(connection.createStatement(CREATE_TABLE.formatted(tableName)).execute())
-                            .concatMap(Result::getRowsUpdated)
-                            .then();
+                    return execute(connection, CREATE_TABLE.formatted(tableName));
                 });
     }
 
@@ -65,7 +73,9 @@ final class AdvisoryLockDao {
         return queryOne(connection, SET_APPLICATION_NAME, _ -> 1, applicationName).then();
     }
 
-    /** @return the number of inserted rows, 0 when the key's row already exists */
+    /**
+     * @return the number of inserted rows, 0 when the key's row already exists
+     */
     Mono<Long> createLockRecord(Connection connection, String key) {
         return Flux.from(connection.createStatement(CREATE_LOCK_RECORD.formatted(tableName)).bind(0, key).execute())
                 .concatMap(Result::getRowsUpdated)
@@ -73,11 +83,21 @@ final class AdvisoryLockDao {
     }
 
     Mono<Boolean> lock(Connection connection, String key) {
-        return queryOne(connection, LOCK.formatted(tableName), row -> row.get("lock_result", Boolean.class), key);
+        return queryOne(connection, LOCK.formatted(tableName), row -> Objects.requireNonNull(row.get("lock_result", Boolean.class)), key);
     }
 
     Mono<Boolean> unlock(Connection connection, String key) {
-        return queryOne(connection, UNLOCK.formatted(tableName), row -> row.get("unlock_result", Boolean.class), key);
+        return queryOne(connection, UNLOCK.formatted(tableName), row -> Objects.requireNonNull(row.get("unlock_result", Boolean.class)), key);
+    }
+
+    Mono<Long> nextFencingToken(Connection connection, String key) {
+        return queryOne(connection, NEXT_FENCING_TOKEN.formatted(tableName), row -> Objects.requireNonNull(row.get("fencing_token", Long.class)), key);
+    }
+
+    private static Mono<Void> execute(Connection connection, String sql) {
+        return Flux.from(connection.createStatement(sql).execute())
+                .concatMap(Result::getRowsUpdated)
+                .then();
     }
 
     private static <T> Mono<T> queryOne(Connection connection, String sql, Function<Readable, T> mapper, Object... arguments) {

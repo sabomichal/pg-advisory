@@ -42,15 +42,17 @@ Without Spring Boot, add the library alone; it depends on R2DBC and Reactor only
 
 ### Lock table
 
-One row per key; its `id` is the advisory lock id. Create it with your migrations from
+One row per key; its `id` is the advisory lock id, its `fencing_token` the token of the last lock of the
+key. Create it with your migrations from
 `classpath:db/pg-advisory/V1__advisory_lock.sql`, or let the library create it
 (`pg-advisory.schema.auto-create=true`, `LockManagerSettings.autoCreateSchema`).
 
 ```sql
 CREATE TABLE IF NOT EXISTS advisory_lock
 (
-    id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    lock_key text   NOT NULL UNIQUE
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    lock_key      text   NOT NULL UNIQUE,
+    fencing_token bigint NOT NULL DEFAULT 0
 );
 ```
 
@@ -90,7 +92,6 @@ In a Spring application without Boot, return it from a `@Bean` method; Spring cl
 |---------------------------------------------|-----------------------------------------------------------------------------|
 | `tryWithLock(key, work)`                    | Locks `key` without waiting, runs `work`, unlocks; returns a `LockOutcome`. |
 | `tryWithLock(key, onLock, onFinally, work)` | The same, with callbacks right before and after `work`.                     |
-| `validateDbConnection()`                    | Checks the lock connection and re-creates it when it is broken.             |
 
 `tryWithLock` returns a sealed `LockManager.LockOutcome`:
 
@@ -103,8 +104,24 @@ It fails with `LockFailedException` when the key could not be locked because of 
 database is unreachable; the work did not run then either. Errors of the work and of the unlock are
 propagated unchanged.
 
-The work and the callbacks get a `LockManager.LockHandle` with the key. The handle is also in the Reactor context of the work, so
-code deep inside it finds the lock with `LockHandle.current()`.
+The work and the callbacks get a `LockManager.LockHandle` with the key and the fencing token of the lock. The handle is also in
+the Reactor context of the work, so code deep inside it finds the lock with `LockHandle.current()`.
+
+### Fencing token
+
+A lock does not guarantee that its holder still has it when a write arrives. When the lock connection
+dies, PostgreSQL releases the lock, another instance takes the key over, and a write of the old holder
+may land after the writes of the new one. `LockHandle.fencingToken()` grows with every lock of the key,
+by any instance. Pass it along with the writes, so that their target remembers the highest token and
+rejects older ones:
+
+```sql
+UPDATE job SET result = :result, fencing_token = :token
+WHERE id = :id AND fencing_token <= :token   -- 0 rows: a newer holder of the key has written already
+```
+
+Compare only tokens of the same key. The token does not prove that the lock is still held, it lets the
+target of a write reject an older holder.
 
 ## Observability
 
@@ -166,8 +183,11 @@ All under `pg-advisory`.
    ```sql
    INSERT INTO advisory_lock (lock_key) VALUES (:key) ON CONFLICT (lock_key) DO NOTHING;
    SELECT pg_try_advisory_lock(id) FROM advisory_lock WHERE lock_key = :key;  -- false → Busy(sameInstance = false)
+   UPDATE advisory_lock SET fencing_token = fencing_token + 1 WHERE lock_key = :key RETURNING fencing_token;
    ```
-   Not in a transaction: a session advisory lock would survive its rollback anyway.
+   Not in a transaction: a session advisory lock would survive its rollback anyway. The new
+   `fencing_token` is `LockHandle.fencingToken()`: higher than the token of every earlier lock of the
+   key, by any instance. When it cannot be issued, the key is unlocked again.
 
 Then `work` runs, and the lock is released with `pg_advisory_unlock`. The lock connection serves
 one operation at a time, the others wait in a FIFO queue.
@@ -175,14 +195,13 @@ one operation at a time, the others wait in a FIFO queue.
 A heartbeat validates the lock connection every `heartbeat-interval`, through the same queue. A
 validation that does not answer within `heartbeat-timeout` counts as broken. A broken connection is
 re-created, which drops its locks, and `LockManagerListener.onConnectionReset` is called.
-`validateDbConnection()` does the same on demand.
 
 ## Limitations
 
 - **No fencing.** When the lock connection dies, PostgreSQL releases its locks and another instance
   can take over, while work of this instance may still be running and committing. The heartbeat
   notices it within `heartbeat-interval` and calls `LockManagerListener.onConnectionReset`, the work
-  itself is not told.
+  itself is not told. The fencing token is there, but nothing checks it before a commit yet.
 - Known weaknesses of the current implementation, e.g. a reset lets this instance lock a key again
   while the old work under it still runs, and how they are going to be fixed step by step: see
   [ROADMAP.md](ROADMAP.md).
