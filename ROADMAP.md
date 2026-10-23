@@ -1,72 +1,116 @@
 # Roadmap
 
-The current implementation is a close port of a proven in-house `LockManager`: simple and readable, but
-with known weaknesses. A complete implementation that addresses all of them exists on the branch
-[`full-implementation`](../../tree/full-implementation) (commit `66ca6f7`), reviewed twice. It is hard to
-read as a whole, so it comes back in small steps, each with its regression tests from that branch.
+The implementation started as a close port of a proven in-house `LockManager`. A complete implementation
+that addresses its weaknesses exists on the branch [`full-implementation`](../../tree/full-implementation)
+(commit `66ca6f7`), reviewed twice. It is hard to read as a whole, so it comes back in small steps, each
+with its regression tests from that branch. Done steps are removed from here, the git history keeps them.
 
 Every step below names the problem in the current code, the solution on `full-implementation` and the
-tests that prove it. The order follows the risk: lock leaks first, then detection of a lost lock,
-then fencing, then convenience.
+tests that prove it. The order follows the risk: fencing first, because it protects the data, then the
+lost lock connection, then lifecycle and convenience.
 
 The outcomes differ from `full-implementation` on purpose: sealed variants are only the cases the caller
-reacts to differently. `HeldLocally` is `Busy(sameInstance = true)`, and `Unavailable` is not an outcome
-but the error `LockFailedException(cause)`: the key could not be locked because of an error, and the work
-did not run.
+reacts to differently, an error is a typed exception and not an outcome.
 
-## 1. A lost lock connection goes unnoticed
+## 1. Fencing
 
-**Problem.** Only the validation of the lock connection detects a broken one, run after a
-non-transient R2DBC error or by the application. Until then the instance believes it holds its
-locks while PostgreSQL has released them. An idle lock connection may even be closed by the server
-(`idle_session_timeout`). After a reset the in-memory entries are cleared while old work still runs,
-so the same instance can lock a key again next to it, and the old work's unlock hits the new
-connection.
+**Problem.** After the lock connection died, another instance can take over the key while work of the
+old holder is still running. `LockHandle.fencingToken()` lets the target of a write reject the old
+holder, but only when the application passes the token along. Nothing checks it before a commit of the
+work: both write.
 
-A failed connect is never retried. `SingleConnectionFactory` keeps the error in `Mono.cache()`, so every
-later `tryWithLock` fails with the same `LockFailedException`. The validation that would re-create the
-connection does not start either: it needs `R2dbcNonTransientResourceException` as the root cause, but
-a refused connect is `R2dbcNonTransientResourceException <- AnnotatedConnectException <- ConnectException`.
-The instance stays unusable until the application validates the connection or restarts.
+**Solution.** Every work transaction checks its token right before `COMMIT` under a shared advisory
+barrier lock, and a new holder takes the barrier exclusively, so it waits for in-flight commits of the
+previous holder. `FencingR2dbcTransactionManager` does the check for Spring transactions,
+`LockHandle.verify(connection)` by hand. Under `REPEATABLE READ`/`SERIALIZABLE` the token is read
+`FOR SHARE`, read-only transactions are not checked.
+*Classes:* `Fencer`, `GenerationFencer`, `FencingR2dbcTransactionManager`.
+*Tests:* `staleHolderIsFencedAfterTakeover`, `takeoverWaitsForAnInFlightCommitOfThePreviousHolder`,
+`barrierTimeoutReturnsBusyAndReleasesTheLock`, `repeatableReadTransactionWithAStaleSnapshotIsFenced`,
+`readOnlyTransactionsAreNotFenced`, `transactionInsideTheLockCommits`.
 
-**Solution.** A heartbeat (`validate(REMOTE)` with a timeout), detection of broken sessions from
-errors, reconnect with backoff, and *incarnations*: every reconnect starts a new one, and unlocks of
-an older incarnation are skipped. Running work is told about the loss: `LostLockPolicy.CANCEL_WORK`
-cancels it, `NOTIFY` lets it run. Local registrations stay until the work ends. A new outcome `Lost`
-and `LockHandle.lost()` tell the caller and the work.
-*Classes:* `R2dbcLockSession`, `R2dbcPgAdvisory` (heartbeat, `connectionLost`, `startReconnect`).
+Here it differs on purpose:
+- The takeover never waits. On the lock connection the barrier is only tried, and a barrier held by a
+  committing transaction of the previous holder unlocks the key again and returns
+  `Busy(sameInstance = false)`, like a key held by another instance. The lock connection never blocks,
+  so the library needs no pool of its own, unlike `full-implementation`, which moved the takeover to a
+  pooled connection. The price: while stale work of the previous holder keeps committing, the key stays
+  busy. Its commits are still valid then, no newer token exists yet.
+- A fenced commit fails with the typed error `LockFencedException`, which `tryWithLock` passes
+  unchanged. No outcome `Lost`.
+
+It comes back in the iterations below, one at a time.
+
+### 1.1 The check before commit, with the barrier (`READ COMMITTED`)
+
+`LockHandle.verify(connection)` runs in the work transaction right before its commit. It takes the
+barrier `pg_advisory_xact_lock_shared(namespace, key.hashCode())`, held until the commit, then reads
+`fencing_token`, and another token fails with `LockFencedException`. Outside a transaction, and under
+another isolation than `READ COMMITTED` until 1.2, it fails. The increment of the fencing token tries
+the barrier in the same autocommit statement, `pg_try_advisory_xact_lock(namespace, key.hashCode())`, so
+the barrier is held until the new token is committed. A barrier held by the previous holder unlocks the
+key again and returns `Busy(sameInstance = false)`. So every commit of the old holder either lands
+before the new token or sees it. The namespace of the barrier is a new setting, a `hashCode` collision
+only makes a takeover busy more often. *Tests:* `staleHolderIsFencedAfterTakeover`,
+`takeoverDuringACommitOfThePreviousHolderIsBusy` (other keys of the new holder do not wait),
+`transactionInsideTheLockCommits`.
+
+### 1.2 `REPEATABLE READ` and `SERIALIZABLE`
+
+The snapshot may predate a takeover, so `fencing_token` is read `FOR SHARE`, and a serialization failure
+(`40001`) means fenced. The `UPDATE` of a takeover does not wait for that row lock: it is taken only
+under the shared barrier, which the try ruled out. A short `lock_timeout` as a safeguard.
+*Test:* `repeatableReadTransactionWithAStaleSnapshotIsFenced`.
+
+### 1.3 Spring: `FencingR2dbcTransactionManager`
+
+Calls `verify` in `prepareForCommit` for new transactions inside `tryWithLock` that are not read-only.
+To decide: whether the auto-configuration registers it. *Tests:* a fenced commit through
+`TransactionalOperator`, `readOnlyTransactionsAreNotFenced`.
+
+## 2. A lost lock connection
+
+**Problem.** The heartbeat notices a lost lock connection within `heartbeat-interval` and re-creates
+it, but the rest does not cope with the loss. The reset clears the in-memory entries while old work
+still runs, so the same instance can lock a key again next to it, and the old work's unlock hits the
+new connection. The work is not told that its lock is gone, only the listener gets
+`onConnectionReset`. A failed unlock leaves its key busy until a reset, and a failed connect is retried
+for some errors only, each attempt reported as a reset.
+
+**Solution.** Detection of broken sessions from errors, reconnect with backoff, and *incarnations*:
+every reconnect starts a new one, and unlocks of an older incarnation are skipped. Running work is told
+about the loss: `LostLockPolicy.CANCEL_WORK` cancels it, `NOTIFY` lets it run. Local registrations stay
+until the work ends. A new outcome `Lost` and `LockHandle.lost()` tell the caller and the work.
+*Classes:* `R2dbcLockSession`, `R2dbcPgAdvisory` (`connectionLost`, `startReconnect`).
 *Tests:* `lostSessionCancelsTheWorkAndReconnects`.
 
-It comes back in the iterations below, one at a time. 1.2 to 1.7 follow after step 2: fencing protects
-the data and matters more.
+It comes back in the iterations below, one at a time.
 
-### 1.1 Heartbeat (done)
-
-Every `heartbeat-interval` (5 s) the heartbeat runs `checkAndResetConnection` through the queue like any
-other operation, the next one only after the previous finished. `validate(REMOTE)` gets
-`heartbeat-timeout` (5 s): a connection that does not answer counts as broken, otherwise it would hold
-up the queue for good. A broken connection is re-created and `onConnectionReset` is called. The public
-`validateDbConnection` is gone: the heartbeat does its job, and its name hid the reset.
-*Tests:* `heartbeatReconnectsALostLockConnection`, `heartbeatResetsALockConnectionThatDoesNotAnswer`.
-
-The heartbeat also retries a failed connect: `checkAndResetConnection` re-creates the factory that keeps
-the error. But only for `R2dbcNonTransientResourceException`, and every failed attempt is reported as a
-reset, see 1.4.
-
-### 1.2 A failed unlock resets the lock connection
+### 2.1 A failed unlock leaves the key busy
 
 **Problem.** A failed unlock leaves the key registered and the advisory lock possibly held, until a
 reset clears the registrations. A transient error (`statement_timeout`, `lock_timeout`, a cancelled
-query) starts no reset, `checkConnectionOnError` reacts to non-transient errors only. The key then stays
-`Busy(sameInstance = true)` here and `Busy(sameInstance = false)` elsewhere for good.
+query) starts no reset, `checkConnectionOnError` reacts to non-transient errors only, and the heartbeat
+finds the connection valid. The key then stays `Busy(sameInstance = true)` here and
+`Busy(sameInstance = false)` elsewhere for good. Removing only the registration would leak the lock:
+session advisory locks are reentrant, a new lock of the key would stack on the leftover one.
 
-**Solution.** A failed unlock resets the lock connection, closing it surely releases the lock, and only
-then the registration is removed. The error still reaches the caller. Step 5 discards the connection
-after a failed unlock as well. It comes before 1.3, which removes the clearing that rescues a failed
-unlock today. *Test:* `failedUnlockResetsTheLockConnection`: the first `pg_advisory_unlock` fails with
+**To decide.** Resetting the lock connection surely releases the lock, but drops the locks of all
+other running work too. A broken connection lost its locks anyway, only a healthy one matters.
+`pg_advisory_unlock` can be repeated: the registration keeps the key held at most once on the
+connection, so a repeat returns `true` (released now) or `false` (released by the failed attempt).
+- Retry with the heartbeat: the key stays registered among pending unlocks, which the heartbeat
+  repeats through the queue before the validation. A reset drops them with the connection: a retry
+  must never run on a newer connection, where the key may belong to new work.
+- Retry right away a few times, then reset: no new state, a persistent error still drops all locks.
+- Reset only a broken connection: validate after the failed unlock, a healthy one keeps the key busy.
+
+The failed unlock after a failed fencing token resets the connection today, it would go the same
+way. It comes before 2.2, which removes the clearing that rescues a failed unlock today.
+*Test:* `failedUnlockReleasesTheLock`: the first `pg_advisory_unlock` fails with
 `R2dbcTransientResourceException`, then both instances lock the key.
 
-### 1.3 A reset keeps the registrations of running work
+### 2.2 A reset keeps the registrations of running work
 
 **Problem.** `newConnectionFactory()` clears `currentlyProcessingLocks` while old work still runs. The
 same instance locks the key again next to it, and the old work's unlock on the new connection releases
@@ -78,13 +122,14 @@ instance could have locked it meanwhile. Incarnations are not needed for that.
 *Test:* `resetKeepsTheKeyOfRunningWorkBusy`: A holds the key, its connection is terminated and reset, a
 second lock on A is `Busy(sameInstance = true)`, and after the old work both instances lock the key.
 
-### 1.4 A failed connect is kept only briefly
+### 2.3 A failed connect is kept only briefly
 
-**Problem.** `SingleConnectionFactory` keeps a failed connect in `Mono.cache()` for good. Only
-`checkAndResetConnection` replaces it, and only for `R2dbcNonTransientResourceException`: a failed
-login (`28P01`, `R2dbcPermissionDeniedException`) stays even after the password is fixed. And every
-failed attempt is reported as a reset: `onConnectionReset`, the reset metric and the warning that all
-locks are lost.
+**Problem.** `SingleConnectionFactory` keeps a failed connect in `Mono.cache()` for good. Only the
+heartbeat replaces it, through `checkAndResetConnection`, and only for
+`R2dbcNonTransientResourceException`: a refused connect is retried every `heartbeat-interval`, but a
+failed login (`28P01`, `R2dbcPermissionDeniedException`) stays even after the password is fixed. And
+every failed attempt is reported as a reset: `onConnectionReset`, the reset metric and the warning that
+all locks are lost.
 
 **Solution.** The error of a connect is kept for `reconnect-delay` (a new setting, about 1 s), with
 `Mono.cache(ttlForValue, ttlForError, ttlForEmpty)`: locks fail fast in between, then the next operation
@@ -92,21 +137,21 @@ connects again. `checkAndResetConnection` resets only a connection that existed.
 *Test:* a `ConnectionFactory` that refuses the first connects with `R2dbcPermissionDeniedException`, a
 later lock succeeds and no reset is reported.
 
-### 1.5 `LockHandle.lost()`
+### 2.4 `LockHandle.lost()`
 
 **Problem.** Work under a lock cannot learn that the lock is gone. Only the listener sees
 `onConnectionReset`, and not which work it hits.
 
 **Solution.** `currentlyProcessingLocks` maps the key to its handle, a reset marks the handles of all
-held locks as lost, `LockHandle.isLost()` and `Mono<Void> lost()` show it. Builds on 1.3.
+held locks as lost, `LockHandle.isLost()` and `Mono<Void> lost()` show it. Builds on 2.2.
 *Test:* a held key, the connection terminated, `handle.lost()` completes within the heartbeat interval.
 
-### 1.6 Outcome `Lost`
+### 2.5 Outcome `Lost`
 
 Work that finishes after its lock was lost returns `Lost` instead of `Completed`, the caller has to react
 differently. To decide: whether `Lost` carries the value, and what empty work returns.
 
-### 1.7 `LostLockPolicy`
+### 2.6 `LostLockPolicy`
 
 `CANCEL_WORK` cancels the work on the loss (`takeUntilOther(handle.lost())`) and returns `Lost`, `NOTIFY`
 lets it run. To decide: the default, and a per-call overload or a setting only.
@@ -120,96 +165,28 @@ lets it run. To decide: the default, and a per-call overload or a setting only.
   validation has a timeout. A timeout on every operation would also reset while an `INSERT` legitimately
   waits for another client's uncommitted row of the key (see `cancelWhileLockingReleasesTheLock`), so it
   needs a decision of its own.
+- `Mono.usingWhen` wraps an error of the unlock. After completed work it fails with
+  `RuntimeException("Async resource cleanup failed after onComplete")` and the value is lost. After
+  failed work the work's error is only a suppressed exception of
+  `RuntimeException("Async resource cleanup failed after onError")`. The README and `tryWithLock`
+  promise both unchanged. To decide: the work's error always unchanged, and whether a failed unlock
+  fails `tryWithLock` at all (`full-implementation` only logs it).
 
-## 2. Fencing
+## 3. Lifecycle
 
-**Problem.** After the lock connection died, another instance can take over the key while work of the
-old holder is still running. Nothing stops its commits: both write.
+**Problem.** The constructor starts the heartbeat, the lock manager connects lazily, and `close()`
+closes the connection after the queued operations: running work loses its locks in the middle.
 
-**Solution.** Every lock acquisition increments the fencing token in the key's row. Every work
-transaction checks its token right before `COMMIT` under a shared advisory barrier
-lock, and a new holder takes the barrier exclusively, so it waits for in-flight commits of the previous
-holder. `FencingR2dbcTransactionManager` does the check for Spring transactions, `fence(connection)`
-by hand. Under `REPEATABLE READ`/`SERIALIZABLE` the token is read `FOR SHARE`, read-only
-transactions are not checked. The token goes into `Completed` and `LockHandle`, together with
-`LockHandle.verify()`. Empty work has no `Completed`, so its token is only in the `LockHandle`.
-*Classes:* `Fencer`, `GenerationFencer`, `FencingR2dbcTransactionManager`.
-*Tests:* `staleHolderIsFencedAfterTakeover`, `takeoverWaitsForAnInFlightCommitOfThePreviousHolder`,
-`barrierTimeoutReturnsBusyAndReleasesTheLock`, `repeatableReadTransactionWithAStaleSnapshotIsFenced`,
-`readOnlyTransactionsAreNotFenced`, `transactionInsideTheLockCommits`.
-
-Here it differs on purpose:
-- The takeover never waits. On the lock connection the barrier is only tried, and a barrier held by a
-  committing transaction of the previous holder unlocks the key again and returns
-  `Busy(sameInstance = false)`, like a key held by another instance. The lock connection never blocks,
-  so the library needs no pool of its own and step 3 is dropped. The price: while stale work of the
-  previous holder keeps committing, the key stays busy. Its commits are still valid then, no newer
-  token exists yet.
-- A fenced commit fails with the typed error `LockFencedException`, which `tryWithLock` passes
-  unchanged. No outcome `Lost`.
-- The token is only in the `LockHandle`, `Completed` stays as it is.
-
-It comes back in the iterations below, one at a time.
-
-### 2.1 Fencing token (done)
-
-Every lock increments `fencing_token` on the lock connection right after `pg_try_advisory_lock`, in
-autocommit: `UPDATE … SET fencing_token = fencing_token + 1 … RETURNING fencing_token`. The new value is
-`LockHandle.fencingToken()`. The session lock survives a failed increment, so the key is unlocked again
-on the same connection, and when that fails too, the lock connection is reset. The column is in
-`V1__advisory_lock.sql` and in the table that auto-create makes. No migration: nothing was released yet.
-A lock cycle takes 4 round trips instead of 3, yet `locksManyKeysInTime` showed no measurable change in
-one run each: 4.9 s before, 4.8 s after.
-*Tests:* `fencingTokenGrowsWithEveryLockOfTheKey`, `failedFencingTokenReleasesTheLock`.
-
-### 2.2 The check before commit, with the barrier (`READ COMMITTED`)
-
-`LockHandle.verify(connection)` runs in the work transaction right before its commit. It takes the
-barrier `pg_advisory_xact_lock_shared(namespace, key.hashCode())`, held until the commit, then reads
-`fencing_token`, and another token fails with `LockFencedException`. Outside a transaction, and under
-another isolation than `READ COMMITTED` until 2.3, it fails. The increment of 2.1 tries the barrier in
-the same autocommit statement, `pg_try_advisory_xact_lock(namespace, key.hashCode())`, so the barrier
-is held until the new token is committed. A barrier held by the previous holder unlocks the key again
-and returns `Busy(sameInstance = false)`. So every commit of the old holder either lands before the new
-token or sees it. The namespace of the barrier is a new setting, a `hashCode` collision only makes a
-takeover busy more often. *Tests:* `staleHolderIsFencedAfterTakeover`,
-`takeoverDuringACommitOfThePreviousHolderIsBusy` (other keys of the new holder do not wait),
-`transactionInsideTheLockCommits`.
-
-### 2.3 `REPEATABLE READ` and `SERIALIZABLE`
-
-The snapshot may predate a takeover, so `fencing_token` is read `FOR SHARE`, and a serialization failure
-(`40001`) means fenced. The `UPDATE` of a takeover does not wait for that row lock: it is taken only
-under the shared barrier, which the try ruled out. A short `lock_timeout` as a safeguard.
-*Test:* `repeatableReadTransactionWithAStaleSnapshotIsFenced`.
-
-### 2.4 Spring: `FencingR2dbcTransactionManager`
-
-Calls `verify` in `prepareForCommit` for new transactions inside `tryWithLock` that are not read-only.
-To decide: whether the auto-configuration registers it. *Tests:* a fenced commit through
-`TransactionalOperator`, `readOnlyTransactionsAreNotFenced`.
-
-## 3. Takeover without blocking the lock connection (dropped)
-
-On `full-implementation` the takeover waits for in-flight commits of the previous holder, so it had to
-move from the serialized lock connection to a pooled one, with a confirmation on the same incarnation
-of the lock connection that the lock is still held. Here the takeover never waits (step 2), and a pool
-of its own is out of the scope of the library.
-
-## 4. Lifecycle
-
-**Problem.** The lock manager connects lazily and `close()` closes the connection after the queued
-operations: running work loses its locks in the middle.
-
-**Solution.** `start()`/`stop()`: stop rejects new locks, waits for running work up to a shutdown
-timeout, cancels the rest and only then closes the lock connection. Both run to their end even if
-the caller cancels (the caller only stops waiting), and a stop racing with a detected loss still stops.
-State changes that the caller must see belong in `doOnTerminate`, before the terminal signal, otherwise
-`stop().then(start())` fails on `STOPPING`. Spring drives it through `SmartLifecycle`.
+**Solution.** `start()`/`stop()`: start connects and starts the heartbeat, stop rejects new locks,
+waits for running work up to a shutdown timeout, cancels the rest and only then closes the lock
+connection. Both run to their end even if the caller cancels (the caller only stops waiting), and a
+stop racing with a detected loss still stops. State changes that the caller must see belong in
+`doOnTerminate`, before the terminal signal, otherwise `stop().then(start())` fails on `STOPPING`.
+Spring drives it through `SmartLifecycle`.
 *Tests:* `stopDrainsRunningWorkAndStartWorksAgain`, `stopCancelsWorkAfterTheShutdownTimeout`,
 `cancelledStopStillDrainsAndClosesTheLockSession`, `cancelledStartStillConnects`, `startRightAfterStop`.
 
-## 5. Keys and the lock record
+## 4. Keys and the lock record
 
 **Solution.** `KeyMapper` (sealed): `registry()` maps the key through its text to the row id, as now,
 `direct()` uses an own lock id, with `localKey` so that colliding keys contend within one instance too
@@ -219,30 +196,19 @@ routing requests to the holder).
 *Tests:* `directKeyMapperCollisionOnlyContends`, `directKeyMapperCollisionIsHeldLocallyWithinOneInstance`.
 
 The `LockRecordWriter` brings a transaction after the lock back (locking itself runs without a
-transaction). The lock is released after the rollback of a failed transaction, and when the unlock
-fails too, the lock connection is discarded. *Test:* `failedRecordWriterReleasesTheLock`.
+transaction). The lock is released after the rollback of a failed transaction, and a failed unlock
+goes as in 2.1. *Test:* `failedRecordWriterReleasesTheLock`.
 
-## 6. Observability, the rest
+## 5. Observability, the rest
 
-Depends on step 1.
+Depends on step 2.
 
 `LockManagerListener` callbacks `onLost` and `onConnectionRestored`, and a health indicator that reports
 the state of the lock connection from the heartbeat, without side effects. A health indicator on
 `checkAndResetConnection` would re-create the connection and stop running work on every probe, and compete
 with locking for the lock connection.
 
-## 7. Locking abandoned keys in bulk
+## 6. Documentation
 
-The original code locked all abandoned keys of a table in one statement (`pg_try_advisory_lock` over
-the rows that nobody holds according to `pg_locks`) and marked them prepared in advance, so that the
-following `tryWithLock` reused the lock. Generalized: the application passes the candidate keys.
-A public `unlock(key)` comes back with it, for keys locked in bulk whose work could not be started.
-Outside of that, `tryWithLock` releases its own locks and a public unlock could only release a lock
-under running work.
-
-## 8. Documentation
-
-How fencing works with an example of a takeover, why a barrier and not `FOR SHARE`, why the takeover
-does not wait, and the
-requirements on the database: no transaction-mode pooler in front of the lock connection,
-`idle_session_timeout` longer than the heartbeat interval.
+How fencing works with an example of a takeover, why a barrier and not `FOR SHARE`, and why the
+takeover does not wait.

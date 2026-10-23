@@ -169,7 +169,7 @@ All under `pg-advisory`.
 | `application-name`                      | `pg-advisory`        | `application_name` of the lock connection, visible in `pg_stat_activity`. |
 | `schema.auto-create`                    | `false`              | Creates the lock table on start when it does not exist.                   |
 | `shutdown-lock-timeout`                 | `30s`                | How long closing waits for the queued operations, then it closes anyway.  |
-| `heartbeat-interval`                    | `5s`                 | How often the lock connection is validated, a broken one is re-created.   |
+| `heartbeat-interval`                    | `1s`                 | How often the lock connection is validated, a broken one is re-created.   |
 | `heartbeat-timeout`                     | `5s`                 | How long a validation may take, then the connection counts as broken.     |
 | `r2dbc.url` / `username` / `password`   | *(`spring.r2dbc.*`)* | Dedicated, unpooled lock connection.                                      |
 
