@@ -175,8 +175,8 @@ one operation at a time, the others wait in a FIFO queue.
 - **No fencing.** When the lock connection dies, PostgreSQL releases its locks and another instance
   can take over, while work of this instance may still be running and committing. Only
   `validateDbConnection` notices it, and then calls `LockManagerListener.onConnectionReset`.
-- Known weaknesses of the current implementation, e.g. cancelling during locking, and how they are
-  going to be fixed step by step: see [ROADMAP.md](ROADMAP.md).
+- Known weaknesses of the current implementation, e.g. a failed connect that is never retried, and how
+  they are going to be fixed step by step: see [ROADMAP.md](ROADMAP.md).
 - The lock connection must reach PostgreSQL directly or through a pooler in session mode, and must
   not come from a pool.
 

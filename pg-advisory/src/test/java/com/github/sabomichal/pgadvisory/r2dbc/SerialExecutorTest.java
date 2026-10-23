@@ -55,6 +55,31 @@ class SerialExecutorTest {
     }
 
     @Test
+    void handsTheValueToOnAbandonedWhenTheCallerCancelled() {
+        var release = new CompletableFuture<String>();
+        var abandoned = new CopyOnWriteArrayList<String>();
+
+        executor.submit(() -> Mono.fromFuture(release), abandoned::add).subscribe().dispose();
+        release.complete("value");
+
+        executor.submit(() -> Mono.just("next")).block(TIMEOUT);
+        assertThat(abandoned).containsExactly("value");
+    }
+
+    @Test
+    void deliveredValueOrFailureIsNotAbandoned() {
+        var abandoned = new CopyOnWriteArrayList<String>();
+        var failing = new CompletableFuture<String>();
+
+        assertThat(executor.submit(() -> Mono.just("value"), abandoned::add).block(TIMEOUT)).isEqualTo("value");
+        executor.submit(() -> Mono.fromFuture(failing), abandoned::add).subscribe(null, _ -> {}).dispose();
+        failing.completeExceptionally(new IllegalStateException("task failed"));
+
+        executor.submit(() -> Mono.just("next")).block(TIMEOUT);
+        assertThat(abandoned).isEmpty();
+    }
+
+    @Test
     void failedTaskDoesNotStopTheQueue() {
         var failure = new IllegalStateException("task failed");
 

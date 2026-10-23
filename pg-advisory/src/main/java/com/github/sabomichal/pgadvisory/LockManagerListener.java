@@ -11,7 +11,7 @@ import java.time.Duration;
  */
 public interface LockManagerListener {
 
-    /** The key was locked and the work starts next. Followed by exactly one {@link #onReleased}. */
+    /** The key was locked, the work starts next unless its caller cancelled meanwhile. Followed by exactly one {@link #onReleased}. */
     default void onLocked(LockHandle handle, Duration lockDuration) {
     }
 

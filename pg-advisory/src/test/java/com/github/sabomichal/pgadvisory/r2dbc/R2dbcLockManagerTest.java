@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.github.sabomichal.pgadvisory.TestPostgres.await;
+import static com.github.sabomichal.pgadvisory.TestPostgres.execute;
 import static com.github.sabomichal.pgadvisory.TestPostgres.terminateConnections;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -182,6 +183,26 @@ class R2dbcLockManagerTest {
         await(a.tryWithLock(key, handle -> Mono.just(handle.key())).onErrorResume(LockFailedException.class, _ -> Mono.empty()));
 
         assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
+    void cancelWhileLockingReleasesTheLock() {
+        var listener = new RecordingListener();
+        var a = lockManager(settings("A"), listener);
+        var b = lockManager(settings("B"));
+        var key = newKey();
+        // an uncommitted row of the key makes the INSERT of A wait until its caller gives up
+        var blocker = await(Mono.<Connection>from(TestPostgres.connectionFactory().create()));
+        await(Mono.from(blocker.beginTransaction()).then(execute(blocker, "INSERT INTO advisory_lock (lock_key) VALUES ($1)", key)));
+
+        assertThat(await(a.tryWithLock(key, _ -> Mono.just("never")).timeout(Duration.ofMillis(300), Mono.empty()))).isNull();
+        await(Mono.from(blocker.rollbackTransaction()).then(Mono.from(blocker.close())));
+
+        // onReleased comes after the key was removed from memory
+        await().atMost(Duration.ofSeconds(10))
+                .untilAsserted(() -> assertThat(listener.calls).containsExactly("locked " + key, "released " + key));
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
+        assertThat(lockAndUnlock(a, key)).isEqualTo(new LockOutcome.Completed<>(key));
     }
 
     @Test

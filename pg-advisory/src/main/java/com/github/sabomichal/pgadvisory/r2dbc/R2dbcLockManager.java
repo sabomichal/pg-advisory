@@ -51,7 +51,9 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         this.connectionFactory = newConnectionFactory();
     }
 
-    /** Without listeners. */
+    /**
+     * Without listeners
+     */
     public R2dbcLockManager(ConnectionFactory lockConnectionFactory, LockManagerSettings settings) {
         this(lockConnectionFactory, settings, List.of());
     }
@@ -93,11 +95,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                             case LockAcquisition.Busy(var sameInstance) -> Mono.just(new LockOutcome.Busy<T>(sameInstance));
                         },
                         lockAcquisition -> lockAcquisition instanceof LockAcquisition.Locked locked ? unlockInternal(locked) : Mono.empty())
-                .doOnError(error -> {
-                    if (rootCause(error) instanceof R2dbcNonTransientResourceException) {
-                        validateDbConnection().subscribe();
-                    }
-                });
+                .doOnError(this::validateConnectionOnError);
     }
 
     @Override
@@ -126,19 +124,29 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         }
         // in auto-commit mode without a transaction - a session advisory lock would survive the rollback of a transaction anyway
         return executor.submit(() -> connectionFactory.create()
-                .flatMap(connection -> dao.createLockRecord(connection, key)
-                        .doOnNext(rowsUpdated -> log.trace(rowsUpdated > 0
-                                ? "[{}] Lock record created key=[{}]"
-                                : "[{}] Lock record exists key=[{}]", settings.applicationName(), key))
-                        .then(dao.lock(connection, key)))
-                .map(acquired -> acquired ? locked(key, started) : busy(key, started))
-                .doOnError(error -> {
-                    currentlyProcessingLocks.remove(key);
-                    log.debug("[{}] Lock failed key=[{}]", settings.applicationName(), key, error);
-                })
-                .onErrorMap(error -> new LockFailedException("Could not lock key=[" + key + "]", error))
-                .doOnError(LockFailedException.class,
-                        error -> notifyListeners(listener -> listener.onLockFailed(key, error, since(started)))));
+                        .flatMap(connection -> dao.createLockRecord(connection, key)
+                                .doOnNext(rowsUpdated -> log.trace(rowsUpdated > 0
+                                        ? "[{}] Lock record created key=[{}]"
+                                        : "[{}] Lock record exists key=[{}]", settings.applicationName(), key))
+                                .then(dao.lock(connection, key)))
+                        .map(acquired -> acquired ? locked(key, started) : busy(key, started))
+                        .doOnError(error -> {
+                            currentlyProcessingLocks.remove(key);
+                            log.debug("[{}] Lock failed key=[{}]", settings.applicationName(), key, error);
+                        })
+                        .onErrorMap(error -> new LockFailedException("Could not lock key=[" + key + "]", error))
+                        .doOnError(LockFailedException.class, error ->
+                                notifyListeners(listener -> listener.onLockFailed(key, error, since(started)))
+                        ),
+                this::releaseAbandonedLock);
+    }
+
+    private void releaseAbandonedLock(LockAcquisition acquisition) {
+        if (acquisition instanceof LockAcquisition.Locked locked) {
+            log.debug("[{}] Releasing key=[{}], caller cancelled before receiving lock",
+                    settings.applicationName(), locked.handle().key());
+            unlockInternal(locked).subscribe(null, this::validateConnectionOnError);
+        }
     }
 
     private LockAcquisition locked(String key, long started) {
@@ -172,6 +180,12 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                 .doOnError(error -> log.warn("[{}] Unlock failed key=[{}], it stays busy on this instance "
                         + "until the lock connection is re-created", settings.applicationName(), key, error))
                 .doOnTerminate(() -> notifyListeners(listener -> listener.onReleased(locked.handle(), since(locked.lockedNanos())))));
+    }
+
+    private void validateConnectionOnError(Throwable error) {
+        if (rootCause(error) instanceof R2dbcNonTransientResourceException) {
+            validateDbConnection().subscribe();
+        }
     }
 
     private void reinitDbConnection() {
