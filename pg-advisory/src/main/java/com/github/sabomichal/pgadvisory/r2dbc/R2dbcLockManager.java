@@ -9,6 +9,7 @@ import io.r2dbc.spi.R2dbcNonTransientResourceException;
 import io.r2dbc.spi.ValidationDepth;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
@@ -23,6 +24,9 @@ import java.util.function.Function;
  * <p>
  * A key is locked in two places: in memory, so that the same instance cannot lock it twice (session advisory locks
  * are reentrant), and in PostgreSQL by {@code pg_try_advisory_lock} on the id of the key's row in the lock table.
+ * <p>
+ * A heartbeat runs {@link #validateDbConnection()} every {@link LockManagerSettings#heartbeatInterval()}, so that a lock
+ * connection lost while idle is noticed and re-created.
  */
 public final class R2dbcLockManager implements LockManager, AutoCloseable {
 
@@ -35,6 +39,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
 
     private final Set<String> currentlyProcessingLocks = ConcurrentHashMap.newKeySet();
     private final SerialExecutor executor = new SerialExecutor();
+    private final Disposable heartbeat;
 
     private volatile SingleConnectionFactory connectionFactory;
 
@@ -49,6 +54,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         this.listeners = List.copyOf(listeners);
         this.dao = new AdvisoryLockDao(settings.tableName());
         this.connectionFactory = newConnectionFactory();
+        this.heartbeat = startHeartbeat();
     }
 
     /**
@@ -64,6 +70,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
      */
     @Override
     public void close() {
+        heartbeat.dispose();
         // a lambda, not a method reference: the connection factory may be re-created before the task runs
         executor.submit(() -> connectionFactory.destroy())
                 .timeout(settings.shutdownLockTimeout(), Mono.defer(() -> {
@@ -101,7 +108,9 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
     @Override
     public Mono<Void> validateDbConnection() {
         return executor.submit(() -> connectionFactory.create()
-                .flatMap(connection -> Mono.from(connection.validate(ValidationDepth.REMOTE)))
+                // an unanswered validation counts as broken, it would hold up the queue of the lock connection
+                .flatMap(connection -> Mono.from(connection.validate(ValidationDepth.REMOTE))
+                        .timeout(settings.heartbeatTimeout(), Mono.just(false)))
                 .flatMap(valid -> valid ? Mono.<Void>empty() : Mono.error(new DbConnectionValidationException()))
                 .doOnError(R2dbcNonTransientResourceException.class, _ -> reinitDbConnection())
                 .doOnError(DbConnectionValidationException.class, _ -> reinitDbConnection())
@@ -180,6 +189,15 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                 .doOnError(error -> log.warn("[{}] Unlock failed key=[{}], it stays busy on this instance "
                         + "until the lock connection is re-created", settings.applicationName(), key, error))
                 .doOnTerminate(() -> notifyListeners(listener -> listener.onReleased(locked.handle(), since(locked.lockedNanos())))));
+    }
+
+    private Disposable startHeartbeat() {
+        return validateDbConnection()
+                .doOnError(error -> log.warn("[{}] Heartbeat of the lock connection failed", settings.applicationName(), error))
+                .onErrorComplete()
+                .delaySubscription(settings.heartbeatInterval())
+                .repeat()
+                .subscribe();
     }
 
     private void validateConnectionOnError(Throwable error) {

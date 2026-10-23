@@ -138,8 +138,8 @@ With Spring Boot every `LockManagerListener` bean is registered, and the auto-co
 | `pg.advisory.connection.resets` | counter | Re-creations of a broken lock connection.                                                           |
 
 Without Spring Boot, pass a `MicrometerLockManagerListener` to the constructor. `micrometer-core` is an
-optional dependency. A health indicator comes later: it needs a heartbeat of the lock connection, see
-[ROADMAP.md](ROADMAP.md).
+optional dependency. A health indicator comes later, reporting the state of the lock connection from the
+heartbeat, see [ROADMAP.md](ROADMAP.md).
 
 ## Properties
 
@@ -152,6 +152,8 @@ All under `pg-advisory`.
 | `application-name`                      | `pg-advisory`        | `application_name` of the lock connection, visible in `pg_stat_activity`. |
 | `schema.auto-create`                    | `false`              | Creates the lock table on start when it does not exist.                   |
 | `shutdown-lock-timeout`                 | `30s`                | How long closing waits for the queued operations, then it closes anyway.  |
+| `heartbeat-interval`                    | `5s`                 | How often the lock connection is validated, a broken one is re-created.   |
+| `heartbeat-timeout`                     | `5s`                 | How long a validation may take, then the connection counts as broken.     |
 | `r2dbc.url` / `username` / `password`   | *(`spring.r2dbc.*`)* | Dedicated, unpooled lock connection.                                      |
 
 ## How it works
@@ -170,15 +172,22 @@ All under `pg-advisory`.
 Then `work` runs, and the lock is released with `pg_advisory_unlock`. The lock connection serves
 one operation at a time, the others wait in a FIFO queue.
 
+A heartbeat validates the lock connection every `heartbeat-interval`, through the same queue. A
+validation that does not answer within `heartbeat-timeout` counts as broken. A broken connection is
+re-created, which drops its locks, and `LockManagerListener.onConnectionReset` is called.
+`validateDbConnection()` does the same on demand.
+
 ## Limitations
 
 - **No fencing.** When the lock connection dies, PostgreSQL releases its locks and another instance
-  can take over, while work of this instance may still be running and committing. Only
-  `validateDbConnection` notices it, and then calls `LockManagerListener.onConnectionReset`.
-- Known weaknesses of the current implementation, e.g. a failed connect that is never retried, and how
-  they are going to be fixed step by step: see [ROADMAP.md](ROADMAP.md).
+  can take over, while work of this instance may still be running and committing. The heartbeat
+  notices it within `heartbeat-interval` and calls `LockManagerListener.onConnectionReset`, the work
+  itself is not told.
+- Known weaknesses of the current implementation, e.g. a reset lets this instance lock a key again
+  while the old work under it still runs, and how they are going to be fixed step by step: see
+  [ROADMAP.md](ROADMAP.md).
 - The lock connection must reach PostgreSQL directly or through a pooler in session mode, and must
-  not come from a pool.
+  not come from a pool. `idle_session_timeout` of the database must be longer than `heartbeat-interval`.
 
 ## Build
 

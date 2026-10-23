@@ -41,6 +41,23 @@ This also fixes the failed connect, if the reconnect does not keep a failed atte
 detection looks at the whole cause chain. *Test to add:* a `ConnectionFactory` that refuses the first
 connects with `R2dbcNonTransientResourceException(new ConnectException())`, after which a later lock succeeds.
 
+**Heartbeat (done).** Every `heartbeat-interval` (5 s) the heartbeat runs `validateDbConnection` through
+the queue like any other operation, the next one only after the previous finished. `validate(REMOTE)`
+gets `heartbeat-timeout` (5 s), on demand too: a connection that does not answer counts as broken,
+otherwise it would hold up the queue for good. A broken connection is re-created and
+`onConnectionReset` is called. *Tests:* `heartbeatReconnectsALostLockConnection`,
+`heartbeatResetsALockConnectionThatDoesNotAnswer`.
+
+Left open from the solution above:
+- Running work is not told about the loss: `Lost`, `LockHandle.lost()`, `LostLockPolicy`.
+- A reset still clears the local registrations of running work, with the consequences described in the
+  problem. The heartbeat resets on its own, so this happens more often now.
+- The heartbeat retries a failed connect: `validateDbConnection` re-creates the factory that keeps the
+  error. But every failed attempt is reported as a reset, and errors of the locking itself are still
+  detected by their root cause only.
+- An operation stuck on a half-open connection holds up the queue and the heartbeat behind it, only the
+  validation has a timeout.
+
 ## 2. Fencing
 
 **Problem.** After the lock connection died, another instance can take over the key while work of the

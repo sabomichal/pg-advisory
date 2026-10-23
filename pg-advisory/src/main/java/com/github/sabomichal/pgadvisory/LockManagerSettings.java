@@ -12,44 +12,59 @@ import java.util.regex.Pattern;
  * @param autoCreateSchema    create the lock table when it does not exist
  * @param shutdownLockTimeout how long closing the lock manager waits for the queued operations, then it closes the
  *                            lock connection anyway
+ * @param heartbeatInterval   how often the lock connection is validated, a broken one is re-created
+ * @param heartbeatTimeout    how long a validation may take, also by {@link LockManager#validateDbConnection()}, then
+ *                            the lock connection counts as broken
  */
 public record LockManagerSettings(
         String tableName,
         String applicationName,
         boolean autoCreateSchema,
-        Duration shutdownLockTimeout) {
+        Duration shutdownLockTimeout,
+        Duration heartbeatInterval,
+        Duration heartbeatTimeout) {
 
     private static final Pattern TABLE_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?");
 
-    /** {@code tableName} goes into the SQL as is, so it must be an identifier, optionally schema qualified. */
+    /**
+     * {@code tableName} goes into the SQL as is, so it must be an identifier, optionally schema qualified.
+     */
     public LockManagerSettings {
         if (!TABLE_NAME.matcher(tableName).matches()) {
             throw new IllegalArgumentException("Invalid table name [" + tableName + "]");
         }
         Objects.requireNonNull(applicationName, "applicationName");
         Objects.requireNonNull(shutdownLockTimeout, "shutdownLockTimeout");
+        Objects.requireNonNull(heartbeatInterval, "heartbeatInterval");
+        Objects.requireNonNull(heartbeatTimeout, "heartbeatTimeout");
     }
 
-    /** Settings of a new {@link #builder()}. */
+    /**
+     * Settings of a new {@link #builder()}.
+     */
     public static LockManagerSettings defaults() {
         return builder().build();
     }
 
     /**
-     * Starts from the defaults: table {@code advisory_lock}, application name {@code pg-advisory}, no auto-create and
-     * 30 s shutdown lock timeout.
+     * Starts from the defaults: table {@code advisory_lock}, application name {@code pg-advisory}, no auto-create,
+     * 30s shutdown lock timeout and a heartbeat every 1s with a 5s timeout.
      */
     public static Builder builder() {
         return new Builder();
     }
 
-    /** Each setter sets the component of the same name, see {@link LockManagerSettings}. */
+    /**
+     * Each setter sets the component of the same name, see {@link LockManagerSettings}.
+     */
     public static final class Builder {
 
         private String tableName = "advisory_lock";
         private String applicationName = "pg-advisory";
         private boolean autoCreateSchema;
         private Duration shutdownLockTimeout = Duration.ofSeconds(30);
+        private Duration heartbeatInterval = Duration.ofSeconds(1);
+        private Duration heartbeatTimeout = Duration.ofSeconds(5);
 
         private Builder() {
         }
@@ -74,8 +89,19 @@ public record LockManagerSettings(
             return this;
         }
 
+        public Builder heartbeatInterval(Duration heartbeatInterval) {
+            this.heartbeatInterval = heartbeatInterval;
+            return this;
+        }
+
+        public Builder heartbeatTimeout(Duration heartbeatTimeout) {
+            this.heartbeatTimeout = heartbeatTimeout;
+            return this;
+        }
+
         public LockManagerSettings build() {
-            return new LockManagerSettings(tableName, applicationName, autoCreateSchema, shutdownLockTimeout);
+            return new LockManagerSettings(tableName, applicationName, autoCreateSchema, shutdownLockTimeout,
+                    heartbeatInterval, heartbeatTimeout);
         }
     }
 }

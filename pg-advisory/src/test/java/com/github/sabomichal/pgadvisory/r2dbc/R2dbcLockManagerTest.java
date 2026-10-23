@@ -223,6 +223,34 @@ class R2dbcLockManagerTest {
     }
 
     @Test
+    void heartbeatReconnectsALostLockConnection() {
+        var listener = new RecordingListener();
+        var applicationName = "lock-manager-" + UUID.randomUUID();
+        var lockManager = lockManager(settings(applicationName).heartbeatInterval(Duration.ofMillis(200)), listener);
+        lockAndUnlock(lockManager, newKey());
+
+        // nothing uses the lock connection, only the heartbeat notices
+        assertThat(terminateConnections(applicationName)).isEqualTo(1);
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(listener.calls).containsOnlyOnce("reset"));
+
+        var key = newKey();
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
+    void heartbeatResetsALockConnectionThatDoesNotAnswer() {
+        var listener = new RecordingListener();
+        var lockManager = lockManager(hangingFirstValidation(TestPostgres.connectionFactory()),
+                settings("A").heartbeatInterval(Duration.ofMillis(200)).heartbeatTimeout(Duration.ofMillis(200)), listener);
+
+        // without the timeout the validation would block the lock connection for good
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(listener.calls).containsOnlyOnce("reset"));
+
+        var key = newKey();
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
     void listenerSeesLockedBusyAndReleased() {
         var listenerA = new RecordingListener();
         var listenerB = new RecordingListener();
@@ -440,6 +468,22 @@ class R2dbcLockManagerTest {
         return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
                 (_, method, args) -> method.getName().equals("commitTransaction")
                         ? Mono.error(new R2dbcTransientResourceException("commit failed"))
+                        : method.invoke(target, args));
+    }
+
+    /** The validation of its first connection never answers, like a connection to an unreachable server. */
+    private static ConnectionFactory hangingFirstValidation(ConnectionFactory target) {
+        var first = new AtomicBoolean(true);
+        return (ConnectionFactory) Proxy.newProxyInstance(ConnectionFactory.class.getClassLoader(), new Class<?>[]{ConnectionFactory.class},
+                (_, method, args) -> method.getName().equals("create")
+                        ? Mono.<Connection>from(target.create()).map(connection -> first.getAndSet(false) ? hangingValidation(connection) : connection)
+                        : method.invoke(target, args));
+    }
+
+    private static Connection hangingValidation(Connection target) {
+        return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
+                (_, method, args) -> method.getName().equals("validate")
+                        ? Mono.never()
                         : method.invoke(target, args));
     }
 
