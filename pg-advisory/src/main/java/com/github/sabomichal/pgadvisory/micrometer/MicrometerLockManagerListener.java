@@ -12,10 +12,6 @@ import io.micrometer.core.instrument.Timer;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Metrics: {@code pg.advisory.lock} (timer, tag {@code outcome}), {@code pg.advisory.hold} (timer),
- * {@code pg.advisory.locks.held} (gauge) and {@code pg.advisory.connection.resets} (counter).
- */
 public class MicrometerLockManagerListener implements LockManagerListener {
 
     private final AtomicInteger held = new AtomicInteger();
@@ -26,8 +22,8 @@ public class MicrometerLockManagerListener implements LockManagerListener {
     private final Timer hold;
     private final Counter connectionResets;
 
-    /** Registers all meters at once, so that they show up before the first lock. */
     public MicrometerLockManagerListener(MeterRegistry registry) {
+        // Registers all meters at once, so that they show up before the first lock.
         this.locked = lockTimer(registry, "locked");
         this.busySameInstance = lockTimer(registry, "busy_same_instance");
         this.busyOtherInstance = lockTimer(registry, "busy_other_instance");

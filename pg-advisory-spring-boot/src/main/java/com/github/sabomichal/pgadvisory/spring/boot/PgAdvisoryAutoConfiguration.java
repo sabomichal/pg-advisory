@@ -44,10 +44,8 @@ public class PgAdvisoryAutoConfiguration {
     @Bean(destroyMethod = "close")
     public R2dbcLockManager lockManager(PgAdvisoryLockConnectionFactory lockConnectionFactory, LockManagerSettings settings,
                                         ObjectProvider<LockManagerListener> listeners) {
-        var lockManager = new R2dbcLockManager(lockConnectionFactory.connectionFactory(), settings,
-                listeners.orderedStream().toList());
-        lockManager.ensureTable().block();
-        return lockManager;
+        R2dbcLockManager.ensureTable(lockConnectionFactory.connectionFactory(), settings).block();
+        return new R2dbcLockManager(lockConnectionFactory.connectionFactory(), settings, listeners.orderedStream().toList());
     }
 
     /** From the {@code pg-advisory.*} properties. */

@@ -11,23 +11,33 @@ import java.time.Duration;
  */
 public interface LockManagerListener {
 
-    /** The key was locked, the work starts next unless its caller cancelled meanwhile. Followed by exactly one {@link #onReleased}. */
+    /**
+     * The key was locked, the work starts next unless its caller cancelled meanwhile. Followed by exactly one {@link #onReleased}.
+     */
     default void onLocked(LockHandle handle, Duration lockDuration) {
     }
 
-    /** The key is locked by this or another instance, see {@link LockOutcome.Busy}. The work does not run. */
+    /**
+     * The key is locked by this or another instance, see {@link LockOutcome.Busy}. The work does not run.
+     */
     default void onBusy(String key, LockOutcome.Busy<?> busy, Duration lockDuration) {
     }
 
-    /** The key could not be locked, {@code tryWithLock} fails with the same {@code error}. The work does not run. */
+    /**
+     * The key could not be locked, {@code tryWithLock} fails with the same {@code error}. The work does not run.
+     */
     default void onLockFailed(String key, LockFailedException error, Duration lockDuration) {
     }
 
-    /** After the unlock, also a failed one, which leaves the key busy on this instance until the connection reset. */
+    /**
+     * After the unlock, also a failed one, which leaves the key busy on this instance until the connection reset.
+     */
     default void onReleased(LockHandle handle, Duration heldDuration) {
     }
 
-    /** The lock connection was found broken and re-created. All its locks are gone, work under them should stop. */
+    /**
+     * The lock connection was found broken and re-created. All its locks are gone, work under them should stop.
+     */
     default void onConnectionReset() {
     }
 }

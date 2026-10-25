@@ -75,11 +75,11 @@ records metrics, see [Observability](#observability).
 ### Plain Java
 
 ```java
-var lockManager = new R2dbcLockManager(
-        ConnectionFactories.get("r2dbc:postgresql://user:password@localhost/app"),   // unpooled
-        LockManagerSettings.builder().autoCreateSchema(true).build(),
-        List.of(new MicrometerLockManagerListener(meterRegistry)));                  // optional
-lockManager.ensureTable().block();
+var connectionFactory = ConnectionFactories.get("r2dbc:postgresql://user:password@localhost/app");  // unpooled
+var settings = LockManagerSettings.builder().autoCreateSchema(true).build();
+R2dbcLockManager.ensureTable(connectionFactory, settings).block();
+var lockManager = new R2dbcLockManager(connectionFactory, settings,
+        List.of(new MicrometerLockManagerListener(meterRegistry)));                               // optional
 // ...
 lockManager.close();
 ```
@@ -101,8 +101,8 @@ In a Spring application without Boot, return it from a `@Bean` method; Spring cl
   one; the work did not run and the callbacks were not called.
 
 It fails with `LockFailedException` when the key could not be locked because of an error, e.g. the
-database is unreachable; the work did not run then either. Errors of the work and of the unlock are
-propagated unchanged.
+database is unreachable or the lock manager is closed; the work did not run then either. Errors of
+the work and of the unlock are propagated unchanged.
 
 The work and the callbacks get a `LockManager.LockHandle` with the key and the fencing token of the lock. The handle is also in
 the Reactor context of the work, so code deep inside it finds the lock with `LockHandle.current()`.
@@ -194,7 +194,9 @@ one operation at a time, the others wait in a FIFO queue.
 
 A heartbeat validates the lock connection every `heartbeat-interval`, through the same queue. A
 validation that does not answer within `heartbeat-timeout` counts as broken. A broken connection is
-re-created, which drops its locks, and `LockManagerListener.onConnectionReset` is called.
+re-created, which drops its locks, and `LockManagerListener.onConnectionReset` is called. The
+operations still queued for it end with it: a lock fails with `LockFailedException`, an unlock has
+nothing left to release.
 
 ## Limitations
 

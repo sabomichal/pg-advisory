@@ -232,7 +232,7 @@ class R2dbcLockManagerTest {
     @Test
     void heartbeatResetsALockConnectionThatDoesNotAnswer() {
         var listener = new RecordingListener();
-        var lockManager = lockManager(hangingFirstValidation(TestPostgres.connectionFactory()),
+        var lockManager = lockManager(hangingFirstValidation(TestPostgres.connectionFactory(), new CompletableFuture<>()),
                 settings("A").heartbeatInterval(Duration.ofMillis(200)).heartbeatTimeout(Duration.ofMillis(200)), listener);
 
         // without the timeout the validation would block the lock connection for good
@@ -240,6 +240,45 @@ class R2dbcLockManagerTest {
 
         var key = newKey();
         assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
+    void lockQueuedOnABrokenSessionFails() {
+        var listener = new RecordingListener();
+        var validating = new CompletableFuture<Void>();
+        var lockManager = lockManager(hangingFirstValidation(TestPostgres.connectionFactory(), validating),
+                settings("A").heartbeatInterval(Duration.ofMillis(200)).heartbeatTimeout(Duration.ofSeconds(1)), listener);
+        validating.join();
+
+        // queued behind the validation, it runs only after the session was reset
+        assertThatThrownBy(() -> lockAndUnlock(lockManager, newKey()))
+                .isInstanceOf(LockFailedException.class)
+                .hasRootCauseInstanceOf(LockSession.SessionFinishedException.class);
+
+        assertThat(listener.calls).containsOnlyOnce("reset");
+        var key = newKey();
+        assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
+    void unlockAfterAResetDoesNotReleaseTheNewLock() {
+        var listener = new RecordingListener();
+        var applicationName = "lock-manager-" + UUID.randomUUID();
+        var a = lockManager(settings(applicationName).heartbeatInterval(Duration.ofMillis(200)), listener);
+        var b = lockManager(settings("B"));
+        var key = newKey();
+        var oldWork = hold(a, key);
+
+        assertThat(terminateConnections(applicationName)).isEqualTo(1);
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(listener.calls).containsOnlyOnce("reset"));
+        // the reset cleared the registration of the old work, see ROADMAP 2.2
+        var newWork = hold(a, key);
+        oldWork.release();
+
+        // the old work's unlock ends with its session, it never reaches the new connection
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Busy<>(false));
+        newWork.release();
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
     }
 
     @Test
@@ -323,15 +362,31 @@ class R2dbcLockManagerTest {
     }
 
     @Test
+    void lockAfterCloseFails() {
+        var listener = new RecordingListener();
+        var lockManager = lockManager(settings("A"), listener);
+        var key = newKey();
+        var workRan = new AtomicBoolean();
+        lockManager.close();
+
+        assertThatThrownBy(() -> await(lockManager.tryWithLock(key, _ -> Mono.fromRunnable(() -> workRan.set(true)))))
+                .isInstanceOf(LockFailedException.class)
+                .hasRootCauseInstanceOf(LockSession.SessionFinishedException.class);
+
+        assertThat(workRan).isFalse();
+        assertThat(listener.calls).containsExactly("failed " + key);
+    }
+
+    @Test
     void missingTableFailsUnlessAutoCreateIsEnabled() {
         var table = "missing_" + UUID.randomUUID().toString().replace("-", "");
 
-        assertThatThrownBy(() -> await(lockManager(settings("A").tableName(table)).ensureTable()))
+        assertThatThrownBy(() -> await(R2dbcLockManager.ensureTable(TestPostgres.connectionFactory(), settings("A").tableName(table).build())))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(table);
 
-        var lockManager = lockManager(settings("B").tableName(table).autoCreateSchema(true));
-        await(lockManager.ensureTable());
+        await(R2dbcLockManager.ensureTable(TestPostgres.connectionFactory(), settings("B").tableName(table).autoCreateSchema(true).build()));
+        var lockManager = lockManager(settings("B").tableName(table));
         var key = newKey();
         assertThat(lockAndUnlock(lockManager, key)).isEqualTo(new LockOutcome.Completed<>(key));
     }
@@ -510,18 +565,19 @@ class R2dbcLockManagerTest {
                         : proxy);
     }
 
-    private static ConnectionFactory hangingFirstValidation(ConnectionFactory target) {
+    /** The validation of the first connection never answers, {@code validating} completes when it starts. */
+    private static ConnectionFactory hangingFirstValidation(ConnectionFactory target, CompletableFuture<Void> validating) {
         var first = new AtomicBoolean(true);
         return (ConnectionFactory) Proxy.newProxyInstance(ConnectionFactory.class.getClassLoader(), new Class<?>[]{ConnectionFactory.class},
                 (_, method, args) -> method.getName().equals("create")
-                        ? Mono.<Connection>from(target.create()).map(connection -> first.getAndSet(false) ? hangingValidation(connection) : connection)
+                        ? Mono.<Connection>from(target.create()).map(connection -> first.getAndSet(false) ? hangingValidation(connection, validating) : connection)
                         : method.invoke(target, args));
     }
 
-    private static Connection hangingValidation(Connection target) {
+    private static Connection hangingValidation(Connection target, CompletableFuture<Void> validating) {
         return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
                 (_, method, args) -> method.getName().equals("validate")
-                        ? Mono.never()
+                        ? Mono.fromRunnable(() -> validating.complete(null)).then(Mono.never())
                         : method.invoke(target, args));
     }
 

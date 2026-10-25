@@ -70,15 +70,13 @@ To decide: whether the auto-configuration registers it. *Tests:* a fenced commit
 
 ## 2. A lost lock connection
 
-**Problem.** The heartbeat notices a lost lock connection within `heartbeat-interval` and re-creates
-it, but the rest does not cope with the loss. The reset clears the in-memory entries while old work
-still runs, so the same instance can lock a key again next to it, and the old work's unlock hits the
-new connection. The work is not told that its lock is gone, only the listener gets
-`onConnectionReset`. A failed unlock leaves its key busy until a reset, and a failed connect is retried
-for some errors only, each attempt reported as a reset.
+**Problem.** The heartbeat notices a lost lock connection within `heartbeat-interval` and replaces its
+`LockSession`, but the rest does not cope with the loss. The reset clears the in-memory entries while
+old work still runs, so the same instance can lock a key again next to it. The work is not told that
+its lock is gone, only the listener gets `onConnectionReset`. A failed unlock leaves its key busy until
+a reset, and a failed connect is retried for some errors only, each attempt reported as a reset.
 
-**Solution.** Detection of broken sessions from errors, reconnect with backoff, and *incarnations*:
-every reconnect starts a new one, and unlocks of an older incarnation are skipped. Running work is told
+**Solution.** Detection of broken sessions from errors and reconnect with backoff. Running work is told
 about the loss: `LostLockPolicy.CANCEL_WORK` cancels it, `NOTIFY` lets it run. Local registrations stay
 until the work ends. A new outcome `Lost` and `LockHandle.lost()` tell the caller and the work.
 *Classes:* `R2dbcLockSession`, `R2dbcPgAdvisory` (`connectionLost`, `startReconnect`).
@@ -86,39 +84,34 @@ until the work ends. A new outcome `Lost` and `LockHandle.lost()` tell the calle
 
 It comes back in the iterations below, one at a time.
 
-### 2.1 A failed unlock leaves the key busy
+### 2.1 Per-key unlock recovery
 
-**Problem.** A failed unlock leaves the key registered and the advisory lock possibly held, until a
-reset clears the registrations. A transient error (`statement_timeout`, `lock_timeout`, a cancelled
-query) starts no reset, `checkConnectionOnError` reacts to non-transient errors only, and the heartbeat
-finds the connection valid. The key then stays `Busy(sameInstance = true)` here and
-`Busy(sameInstance = false)` elsewhere for good. Removing only the registration would leak the lock:
-session advisory locks are reentrant, a new lock of the key would stack on the leftover one.
+**Problem.** A failed unlock may leave an advisory lock held indefinitely. Resetting the connection
+releases it, but also loses every other lock on the same session.
 
-**To decide.** Resetting the lock connection surely releases the lock, but drops the locks of all
-other running work too. A broken connection lost its locks anyway, only a healthy one matters.
-`pg_advisory_unlock` can be repeated: the registration keeps the key held at most once on the
-connection, so a repeat returns `true` (released now) or `false` (released by the failed attempt).
-- Retry with the heartbeat: the key stays registered among pending unlocks, which the heartbeat
-  repeats through the queue before the validation. A reset drops them with the connection: a retry
-  must never run on a newer connection, where the key may belong to new work.
-- Retry right away a few times, then reset: no new state, a persistent error still drops all locks.
-- Reset only a broken connection: validate after the failed unlock, a healthy one keeps the key busy.
+**Solution.** Retry failed unlocks indefinitely on transient errors, scheduling each attempt at the end
+of the `SerialExecutor` queue so other lock operations can proceed. Keep the key registered until the
+unlock succeeds. Non-transient connection failures trigger a session reset. A repeat is safe: the
+registration keeps the key held at most once on the connection, so it returns `true` (released now)
+or `false` (released by the failed attempt).
 
-The failed unlock after a failed fencing token resets the connection today, it would go the same
-way. It comes before 2.2, which removes the clearing that rescues a failed unlock today.
-*Test:* `failedUnlockReleasesTheLock`: the first `pg_advisory_unlock` fails with
-`R2dbcTransientResourceException`, then both instances lock the key.
+The pending retries belong to the `LockSession` of their connection. A reset replaces the entire
+session, so a retry never reaches a new connection, and the finished session discards them: their
+locks went with its connection, so their keys are released. The failed unlock after a failed fencing
+token resets the session today, it goes the same way. It comes before 2.2, which removes the clearing
+that rescues a failed unlock today.
+*Tests:* `transientUnlockFailureRetriesWithoutBlockingOtherLocks`, `failedUnlockPreservesOtherLocks`,
+`sessionResetDiscardsPendingUnlockRetries`.
 
 ### 2.2 A reset keeps the registrations of running work
 
-**Problem.** `newConnectionFactory()` clears `currentlyProcessingLocks` while old work still runs. The
-same instance locks the key again next to it, and the old work's unlock on the new connection releases
-the new holder's lock, so the key can be locked a third time.
+**Problem.** `replaceSession()` clears `currentlyProcessingLocks` while old work still runs. The same
+instance locks the key again next to it, and the old work's release then removes the new work's
+registration, so a third lock of the key reenters the new work's lock on the same connection.
 
-**Solution.** No clearing, a registration ends with its work. The old work's unlock on the new
-connection finds the key not held and returns `false` (the existing warning), nobody else on this
-instance could have locked it meanwhile. Incarnations are not needed for that.
+**Solution.** No clearing, a registration ends with its work. The old work's unlock ends with its
+finished session (the existing warning), nobody else on this instance could have locked the key
+meanwhile.
 *Test:* `resetKeepsTheKeyOfRunningWorkBusy`: A holds the key, its connection is terminated and reset, a
 second lock on A is `Busy(sameInstance = true)`, and after the old work both instances lock the key.
 

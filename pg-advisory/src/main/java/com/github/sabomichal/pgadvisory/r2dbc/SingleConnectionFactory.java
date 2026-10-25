@@ -17,7 +17,9 @@ final class SingleConnectionFactory {
     private final AtomicReference<@Nullable Connection> created = new AtomicReference<>();
     private final Mono<Connection> connection;
 
-    /** @param initializer runs once on the new connection */
+    /**
+     * @param initializer runs once on the new connection
+     */
     SingleConnectionFactory(ConnectionFactory target, Function<Connection, Mono<Void>> initializer) {
         this.connection = Mono.<Connection>from(target.create())
                 .doOnNext(created::set)
@@ -29,7 +31,9 @@ final class SingleConnectionFactory {
         return connection.flatMap(shared -> Mono.from(shared.setAutoCommit(true)).thenReturn(shared));
     }
 
-    /** Closes the connection if there is one, PostgreSQL then releases its session advisory locks. */
+    /**
+     * Closes the connection if there is one, PostgreSQL then releases its session advisory locks.
+     */
     Mono<Void> destroy() {
         return Mono.defer(() -> {
             var shared = created.getAndSet(null);
