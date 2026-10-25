@@ -63,10 +63,10 @@ public class PgAdvisoryAutoConfiguration {
     }
 
     /**
-     * The lock manager always gets a connection factory of its own, never the application's pool: from
-     * {@code pg-advisory.r2dbc.*} when set, otherwise from the application's connection details. Either way the
-     * application's {@link ConnectionFactoryOptionsBuilderCustomizer}s apply, like they do to the application's
-     * factory, so that the lock connection sees the same database and schema.
+     * A connection factory of its own, never the application's pool: from {@code pg-advisory.r2dbc.*} when set,
+     * otherwise from the application's connection details. The application's
+     * {@link ConnectionFactoryOptionsBuilderCustomizer}s apply either way, so the lock connection sees the same database
+     * and schema.
      */
     @Bean
     @ConditionalOnMissingBean

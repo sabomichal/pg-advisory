@@ -201,12 +201,14 @@ class R2dbcLockManagerTest {
     void reconnectsWhenTheLockConnectionIsBroken() {
         var listener = new RecordingListener();
         var applicationName = "lock-manager-" + UUID.randomUUID();
-        var lockManager = lockManager(settings(applicationName), listener);
+        var lockManager = lockManager(settings(applicationName).heartbeatInterval(Duration.ofHours(1)), listener);
         lockAndUnlock(lockManager, newKey());
 
         assertThat(terminateConnections(applicationName)).isEqualTo(1);
+        // without a heartbeat, the non-transient error of a lock checks the connection
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
-            await(lockManager.checkAndResetConnection());
+            await(lockManager.tryWithLock(newKey(), handle -> Mono.just(handle.key()))
+                    .onErrorResume(LockFailedException.class, _ -> Mono.empty()));
             assertThat(listener.calls).containsOnlyOnce("reset");
         });
 
@@ -271,7 +273,7 @@ class R2dbcLockManagerTest {
 
         assertThat(terminateConnections(applicationName)).isEqualTo(1);
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(listener.calls).containsOnlyOnce("reset"));
-        // the reset cleared the registration of the old work, see ROADMAP 2.2
+        // the reset cleared the registration of the old work, see ROADMAP 1.1
         var newWork = hold(a, key);
         oldWork.release();
 
@@ -406,7 +408,7 @@ class R2dbcLockManagerTest {
 
     @Test
     void failedFencingTokenReleasesTheLock() {
-        var a = lockManager(failingFirstStatement(TestPostgres.connectionFactory(), "fencing_token + 1"), settings("A"));
+        var a = lockManager(failingFirstStatement(TestPostgres.connectionFactory(), "fencing_token + 1", new CompletableFuture<>()), settings("A"));
         var b = lockManager(settings("B"));
         var key = newKey();
 
@@ -415,6 +417,75 @@ class R2dbcLockManagerTest {
 
         assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
         assertThat(lockAndUnlock(a, key)).isEqualTo(new LockOutcome.Completed<>(key));
+    }
+
+    @Test
+    void transientUnlockFailureRetriesWithoutBlockingOtherLocks() {
+        var listener = new RecordingListener();
+        var unlockFailed = new CompletableFuture<Void>();
+        var a = lockManager(failingFirstStatement(TestPostgres.connectionFactory(), "pg_advisory_unlock", unlockFailed),
+                settings("A").unlockRetryMinBackoff(Duration.ofSeconds(1)).unlockRetryMaxBackoff(Duration.ofSeconds(1)), listener);
+        var b = lockManager(settings("B"));
+        var key = newKey();
+
+        var outcome = a.tryWithLock(key, handle -> Mono.just(handle.key())).toFuture();
+        unlockFailed.join();
+
+        // the repeated unlock waits, the lock connection serves other locks meanwhile
+        var other = newKey();
+        assertThat(lockAndUnlock(a, other)).isEqualTo(new LockOutcome.Completed<>(other));
+        assertThat(lockAndUnlock(a, key)).isEqualTo(new LockOutcome.Busy<>(true));
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Busy<>(false));
+        assertThat(outcome).isNotDone();
+
+        assertThat(outcome.join()).isEqualTo(new LockOutcome.Completed<>(key));
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
+        assertThat(listener.calls).doesNotContain("reset");
+    }
+
+    @Test
+    void failedUnlockPreservesOtherLocks() {
+        var listener = new RecordingListener();
+        var a = lockManager(failingFirstStatement(TestPostgres.connectionFactory(), "pg_advisory_unlock", new CompletableFuture<>()),
+                settings("A"), listener);
+        var b = lockManager(settings("B"));
+        var held = newKey();
+        var holder = hold(a, held);
+        var key = newKey();
+
+        // the unlock of key fails once, a reset would release the held key as well
+        assertThat(lockAndUnlock(a, key)).isEqualTo(new LockOutcome.Completed<>(key));
+
+        assertThat(lockAndUnlock(b, held)).isEqualTo(new LockOutcome.Busy<>(false));
+        holder.release();
+        assertThat(lockAndUnlock(b, held)).isEqualTo(new LockOutcome.Completed<>(held));
+        assertThat(listener.calls).doesNotContain("reset");
+    }
+
+    @Test
+    void sessionResetDiscardsPendingUnlockRetries() {
+        var listener = new RecordingListener();
+        var unlockFailed = new CompletableFuture<Void>();
+        var applicationName = "lock-manager-" + UUID.randomUUID();
+        var a = lockManager(failingFirstStatement(TestPostgres.connectionFactory(), "pg_advisory_unlock", unlockFailed),
+                settings(applicationName).heartbeatInterval(Duration.ofMillis(200))
+                        .unlockRetryMinBackoff(Duration.ofSeconds(3)).unlockRetryMaxBackoff(Duration.ofSeconds(3)), listener);
+        var b = lockManager(settings("B"));
+        var key = newKey();
+        var oldOutcome = a.tryWithLock(key, handle -> Mono.just(handle.key())).toFuture();
+        unlockFailed.join();
+
+        // the heartbeat resets the session while the repeated unlock waits
+        assertThat(terminateConnections(applicationName)).isEqualTo(1);
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(listener.calls).containsOnlyOnce("reset"));
+        // the reset cleared the registration of the key, see ROADMAP 1.1
+        var newWork = hold(a, key);
+
+        // the pending retry ends with its session, it never reaches the new connection
+        assertThat(oldOutcome.join()).isEqualTo(new LockOutcome.Completed<>(key));
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Busy<>(false));
+        newWork.release();
+        assertThat(lockAndUnlock(b, key)).isEqualTo(new LockOutcome.Completed<>(key));
     }
 
     @Test
@@ -543,25 +614,29 @@ class R2dbcLockManagerTest {
                         : method.invoke(target, args));
     }
 
-    private static ConnectionFactory failingFirstStatement(ConnectionFactory target, String sql) {
+    /** The first statement containing {@code sql} fails, {@code failing} completes when it does. */
+    private static ConnectionFactory failingFirstStatement(ConnectionFactory target, String sql, CompletableFuture<Void> failing) {
         var failed = new AtomicBoolean();
         return (ConnectionFactory) Proxy.newProxyInstance(ConnectionFactory.class.getClassLoader(), new Class<?>[]{ConnectionFactory.class},
                 (_, method, args) -> method.getName().equals("create")
-                        ? Mono.<Connection>from(target.create()).map(connection -> failingStatement(connection, sql, failed))
+                        ? Mono.<Connection>from(target.create()).map(connection -> failingStatement(connection, sql, failed, failing))
                         : method.invoke(target, args));
     }
 
-    private static Connection failingStatement(Connection target, String sql, AtomicBoolean failed) {
+    private static Connection failingStatement(Connection target, String sql, AtomicBoolean failed, CompletableFuture<Void> failing) {
         return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class},
                 (_, method, args) -> method.getName().equals("createStatement") && ((String) args[0]).contains(sql) && failed.compareAndSet(false, true)
-                        ? failingExecution()
+                        ? failingExecution(failing)
                         : method.invoke(target, args));
     }
 
-    private static Statement failingExecution() {
+    private static Statement failingExecution(CompletableFuture<Void> failing) {
         return (Statement) Proxy.newProxyInstance(Statement.class.getClassLoader(), new Class<?>[]{Statement.class},
                 (proxy, method, _) -> method.getName().equals("execute")
-                        ? Flux.error(new R2dbcTransientResourceException("statement failed"))
+                        ? Flux.defer(() -> {
+                            failing.complete(null);
+                            return Flux.error(new R2dbcTransientResourceException("statement failed"));
+                        })
                         : proxy);
     }
 

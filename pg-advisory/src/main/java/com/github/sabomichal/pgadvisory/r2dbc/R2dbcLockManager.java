@@ -10,6 +10,7 @@ import io.r2dbc.spi.R2dbcNonTransientResourceException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
 
 import java.time.Duration;
 import java.util.List;
@@ -20,14 +21,14 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
- * {@link LockManager} on one shared R2DBC connection, which serves one operation at a time, in the order of submission.
+ * {@link LockManager} on one R2DBC connection, serving one operation at a time in submission order.
  * <p>
- * A key is locked in two places: in memory, so that the same instance cannot lock it twice (session advisory locks
- * are reentrant), and in PostgreSQL by {@code pg_try_advisory_lock} on the id of the key's row in the lock table.
+ * A key is locked in memory against this instance, since session advisory locks are reentrant, and in PostgreSQL by
+ * {@code pg_try_advisory_lock} on the id of its row in the lock table.
  * <p>
- * The lock connection, its queue and its heartbeat form a session. The heartbeat checks the connection every
- * {@link LockManagerSettings#heartbeatInterval()}, and a broken session is replaced by a new one. Operations still queued
- * on the broken one end with it: a lock fails, an unlock has nothing left to release.
+ * The connection, its queue and its heartbeat form a session. A session found broken within
+ * {@link LockManagerSettings#heartbeatInterval()} is replaced, and the operations queued on it end with it: a lock
+ * fails, an unlock has nothing left to release.
  */
 public final class R2dbcLockManager implements LockManager, AutoCloseable {
 
@@ -47,8 +48,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
      * @param lockConnectionFactory unpooled factory of the lock connection
      * @param listeners             called in order, a failing one is logged and does not stop the others
      */
-    public R2dbcLockManager(ConnectionFactory lockConnectionFactory, LockManagerSettings settings,
-                            List<? extends LockManagerListener> listeners) {
+    public R2dbcLockManager(ConnectionFactory lockConnectionFactory, LockManagerSettings settings, List<? extends LockManagerListener> listeners) {
         this.lockConnectionFactory = lockConnectionFactory;
         this.settings = settings;
         this.listeners = List.copyOf(listeners);
@@ -61,21 +61,6 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
      */
     public R2dbcLockManager(ConnectionFactory lockConnectionFactory, LockManagerSettings settings) {
         this(lockConnectionFactory, settings, List.of());
-    }
-
-    /**
-     * Waits up to the shutdown lock timeout for the queued operations, then closes the lock connection anyway, so that
-     * its locks are released. Waits even when interrupted, the thread stays interrupted.
-     */
-    @Override
-    public void close() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        session.close()
-                .toFuture()
-                // unlike block(), join() keeps waiting when interrupted
-                .join();
     }
 
     @Override
@@ -92,29 +77,41 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
             String key, Consumer<LockHandle> onLock, Consumer<LockHandle> onFinally, Function<LockHandle, Mono<T>> work) {
         return Mono.usingWhen(
                         Mono.defer(() -> lock(key)),
-                        lockAcquisition -> switch (lockAcquisition) {
-                            case LockAcquisition.Locked(var handle, _, _) -> Mono.defer(() -> work.apply(handle))
+                        attempt -> switch (attempt) {
+                            case LockAttempt.Locked(var handle, _, _) -> Mono.defer(() -> work.apply(handle))
                                     .contextWrite(context -> context.put(LockHandle.CONTEXT_KEY, handle))
                                     .doFirst(() -> onLock.accept(handle))
                                     .doFinally(_ -> onFinally.accept(handle))
                                     .<LockOutcome<T>>map(LockOutcome.Completed::new);
-                            case LockAcquisition.Busy(var sameInstance) -> Mono.just(new LockOutcome.Busy<T>(sameInstance));
+                            case LockAttempt.NoToken(_, var error, _) -> Mono.error(error);
+                            case LockAttempt.Busy(var sameInstance) -> Mono.just(new LockOutcome.Busy<T>(sameInstance));
                         },
-                        lockAcquisition -> lockAcquisition instanceof LockAcquisition.Locked locked ? unlockInternal(locked) : Mono.empty())
-                .doOnError(this::checkConnectionOnError);
+                        attempt -> switch (attempt) {
+                            case LockAttempt.Locked locked -> unlock(locked);
+                            case LockAttempt.NoToken noToken -> release(noToken.session(), noToken.key());
+                            case LockAttempt.Busy _ -> Mono.empty();
+                        })
+                .doOnError(t -> checkConnectionOnError(session, t));
     }
 
     /**
-     * Validates the lock connection of the current session and replaces a broken session, closing its connection drops
-     * all its locks. Run after a non-transient error, the heartbeat of the session does the same.
+     * Closes the lock connection, releasing its locks, after the queued operations or the shutdown lock timeout. Keeps
+     * waiting when interrupted, the thread stays interrupted.
      */
-    Mono<Void> checkAndResetConnection() {
-        return session.checkAndResetConnection();
+    @Override
+    public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
+        session.close()
+                .toFuture()
+                // unlike block(), join() keeps waiting when interrupted
+                .join();
     }
 
     /**
-     * Verifies the lock table on a connection of its own, creates a missing one when
-     * {@link LockManagerSettings#autoCreateSchema()}. Run it before creating the lock manager, with the same factory.
+     * Verifies the lock table on its own connection, creates a missing one when
+     * {@link LockManagerSettings#autoCreateSchema()}. Run it before the lock manager, with the same factory.
      */
     public static Mono<Void> ensureTable(ConnectionFactory connectionFactory, LockManagerSettings settings) {
         var dao = new AdvisoryLockDao(settings.tableName());
@@ -123,7 +120,7 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                 Connection::close);
     }
 
-    private Mono<LockAcquisition> lock(String key) {
+    private Mono<LockAttempt> lock(String key) {
         var started = System.nanoTime();
         if (closed.get()) {
             var error = new LockFailedException("Could not lock key=[" + key + "], the lock manager is closed",
@@ -134,10 +131,10 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         if (!currentlyProcessingLocks.add(key)) {
             log.debug("[{}] Busy key=[{}], held by this instance", settings.applicationName(), key);
             notifyListeners(listener -> listener.onBusy(key, new LockOutcome.Busy<>(true), since(started)));
-            return Mono.just(new LockAcquisition.Busy(true));
+            return Mono.just(new LockAttempt.Busy(true));
         }
-        // no transaction: a failed COMMIT would roll back the INSERT but keep the session advisory lock, which would then leak
-        // until the shared lock connection closes. The single INSERT is atomic on its own, so a transaction would protect nothing.
+        // no transaction: a failed COMMIT would roll back the INSERT but keep the session advisory lock, leaked until the
+        // connection closes. The single INSERT is atomic anyway.
         var session = this.session;
         return session.execute(lockConnection -> lockConnection
                         .flatMap(connection -> dao.createLockRecord(connection, key)
@@ -145,7 +142,10 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                                         log.trace(rowsUpdated > 0 ? "[{}] Lock record created key=[{}]" : "[{}] Lock record exists key=[{}]", settings.applicationName(), key))
                                 .then(dao.lock(connection, key))
                                 .flatMap(acquired -> acquired
-                                        ? nextFencingToken(session, connection, key).map(token -> locked(key, token, started, session))
+                                        ? dao.nextFencingToken(connection, key)
+                                        .map(token -> locked(key, token, started, session))
+                                        // not an error: the held lock is released after this task, like any other
+                                        .onErrorResume(error -> Mono.just(noToken(key, error, started, session)))
                                         : Mono.just(busy(key, started))))
                         .doOnError(error -> {
                             currentlyProcessingLocks.remove(key);
@@ -158,62 +158,87 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
                 this::releaseAbandonedLock);
     }
 
-    private void releaseAbandonedLock(LockAcquisition acquisition) {
-        if (acquisition instanceof LockAcquisition.Locked locked) {
-            log.debug("[{}] Releasing key=[{}], caller cancelled before receiving lock",
-                    settings.applicationName(), locked.handle().key());
-            unlockInternal(locked).subscribe(null, this::checkConnectionOnError);
+    private void releaseAbandonedLock(LockAttempt attempt) {
+        switch (attempt) {
+            case LockAttempt.Locked locked -> {
+                log.debug("[{}] Releasing key=[{}], caller cancelled before receiving lock", settings.applicationName(), locked.handle().key());
+                unlock(locked).subscribe();
+            }
+            case LockAttempt.NoToken noToken -> {
+                release(noToken.session(), noToken.key()).subscribe();
+            }
+            case LockAttempt.Busy _ -> {
+            }
         }
     }
 
-    private Mono<Long> nextFencingToken(LockSession session, Connection connection, String key) {
-        return dao.nextFencingToken(connection, key)
-                .onErrorResume(error -> dao.unlock(connection, key)
-                        .doOnError(_ -> session.reset())
-                        .onErrorComplete()
-                        .then(Mono.error(error)));
+    private Mono<Void> unlock(LockAttempt.Locked locked) {
+        return release(locked.session(), locked.handle().key())
+                .doOnTerminate(() -> notifyListeners(listener -> listener.onReleased(locked.handle(), since(locked.lockedNanos()))));
     }
 
-    private LockAcquisition locked(String key, long fencingToken, long started, LockSession session) {
-        var locked = new LockAcquisition.Locked(new DefaultLockHandle(key, fencingToken), System.nanoTime(), session);
+    private LockAttempt locked(String key, long fencingToken, long started, LockSession session) {
+        var locked = new LockAttempt.Locked(new DefaultLockHandle(key, fencingToken), System.nanoTime(), session);
         log.debug("[{}] Locked key=[{}] fencingToken=[{}]", settings.applicationName(), key, fencingToken);
         notifyListeners(listener -> listener.onLocked(locked.handle(), Duration.ofNanos(locked.lockedNanos() - started)));
         return locked;
     }
 
-    private LockAcquisition busy(String key, long started) {
+    private LockAttempt noToken(String key, Throwable cause, long started, LockSession session) {
+        var error = new LockFailedException("Could not lock key=[" + key + "]", cause);
+        log.debug("[{}] Lock failed key=[{}], no fencing token, unlocking it again", settings.applicationName(), key, cause);
+        notifyListeners(listener -> listener.onLockFailed(key, error, since(started)));
+        return new LockAttempt.NoToken(key, error, session);
+    }
+
+    private LockAttempt busy(String key, long started) {
         currentlyProcessingLocks.remove(key);
         log.debug("[{}] Busy key=[{}], held by another instance", settings.applicationName(), key);
         notifyListeners(listener -> listener.onBusy(key, new LockOutcome.Busy<>(false), since(started)));
-        return new LockAcquisition.Busy(false);
+        return new LockAttempt.Busy(false);
     }
 
-    private Mono<String> unlockInternal(LockAcquisition.Locked locked) {
-        var key = locked.handle().key();
-        var session = locked.session();
+    /**
+     * Unlocks {@code key} on the session that locked it. A failed unlock is repeated with a backoff at the end of the
+     * queue, until it succeeds or the session ends and takes the lock along. The key stays busy until then.
+     */
+    private Mono<Void> release(LockSession session, String key) {
         return session.execute(lockConnection -> lockConnection
-                .flatMap(connection -> dao.unlock(connection, key))
-                // the lock went with the connection of the ended session
-                .onErrorResume(LockSession.SessionFinishedException.class, _ -> Mono.just(false))
-                .map(unlocked -> {
+                        .flatMap(connection -> dao.unlock(connection, key))
+                        // the lock went with the ended session
+                        .onErrorResume(LockSession.SessionFinishedException.class, _ -> Mono.just(false)))
+                .retryWhen(Retry.backoff(Long.MAX_VALUE, settings.unlockRetryMinBackoff())
+                        .maxBackoff(settings.unlockRetryMaxBackoff())
+                        .doBeforeRetry(signal -> unlockFailed(session, key, signal)))
+                // outside the task, safe: usingWhen and releaseAbandonedLock never cancel a release
+                .doOnNext(unlocked -> {
                     if (unlocked) {
                         log.debug("[{}] Unlocked key=[{}]", settings.applicationName(), key);
                     } else {
-                        log.warn("[{}] Unlock found key=[{}] already released, the lock connection was "
-                                + "probably re-created", settings.applicationName(), key);
+                        log.warn("[{}] Unlock found key=[{}] already released, the lock connection was probably re-created", settings.applicationName(), key);
                     }
-                    return key;
+                    currentlyProcessingLocks.remove(key);
                 })
-                .doOnSuccess(_ -> currentlyProcessingLocks.remove(key))
-                .doOnError(error -> log.warn("[{}] Unlock failed key=[{}], it stays busy on this instance "
-                        + "until the lock connection is re-created", settings.applicationName(), key, error))
-                .doOnTerminate(() -> notifyListeners(listener -> listener.onReleased(locked.handle(), since(locked.lockedNanos())))));
+                .then();
     }
 
-    private void checkConnectionOnError(Throwable error) {
-        if (rootCause(error) instanceof R2dbcNonTransientResourceException) {
-            checkAndResetConnection().subscribe();
+    private void unlockFailed(LockSession session, String key, Retry.RetrySignal signal) {
+        if (signal.totalRetries() == 0) {
+            log.warn("[{}] Unlock failed key=[{}], repeating it until it succeeds, the key stays busy on this instance", settings.applicationName(), key, signal.failure());
+        } else {
+            log.debug("[{}] Unlock failed again key=[{}]", settings.applicationName(), key, signal.failure());
         }
+        checkConnectionOnError(session, signal.failure());
+    }
+
+    private static void checkConnectionOnError(LockSession session, Throwable error) {
+        if (rootCause(error) instanceof R2dbcNonTransientResourceException) {
+            session.checkAndResetConnection().subscribe();
+        }
+    }
+
+    private LockSession createSession() {
+        return new LockSession(lockConnectionFactory, dao, settings, this::replaceSession);
     }
 
     private void replaceSession() {
@@ -222,14 +247,10 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
         notifyListeners(LockManagerListener::onConnectionReset);
         var nextSession = createSession();
         session = nextSession;
-        // close() sets closed before it reads the session, so either it or this closes the new session
+        // close() sets closed before reading the session, so one of the two closes the new one
         if (closed.get()) {
             nextSession.close().subscribe();
         }
-    }
-
-    private LockSession createSession() {
-        return new LockSession(lockConnectionFactory, dao, settings, this::replaceSession);
     }
 
     private void notifyListeners(Consumer<LockManagerListener> callback) {
@@ -255,18 +276,28 @@ public final class R2dbcLockManager implements LockManager, AutoCloseable {
     }
 
     /**
-     * What {@link #lock} got: the lock, or a key locked by this or another instance.
+     * Result of {@link #lock}: locked, locked without a fencing token, or busy.
      */
-    private sealed interface LockAcquisition {
+    private sealed interface LockAttempt {
 
         /**
-         * {@code lockedNanos} by {@link System#nanoTime()}, for the hold time. {@code session} holds the lock on its
-         * connection, and only it can release it.
+         * {@code lockedNanos} from {@link System#nanoTime()} for the hold time, {@code session} holds the lock and alone
+         * can release it.
          */
-        record Locked(LockHandle handle, long lockedNanos, LockSession session) implements LockAcquisition {
+        record Locked(LockHandle handle, long lockedNanos, LockSession session) implements LockAttempt {
         }
 
-        record Busy(boolean sameInstance) implements LockAcquisition {
+        /**
+         * Locked, but without a fencing token. The work does not run, {@code tryWithLock} fails with {@code error} once
+         * the lock is released.
+         */
+        record NoToken(String key, LockFailedException error, LockSession session) implements LockAttempt {
+        }
+
+        /**
+         * Locked by this instance when {@code sameInstance}, otherwise by another one. Nothing to release.
+         */
+        record Busy(boolean sameInstance) implements LockAttempt {
         }
     }
 }

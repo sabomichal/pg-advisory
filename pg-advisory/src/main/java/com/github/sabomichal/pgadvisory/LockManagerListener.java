@@ -30,7 +30,7 @@ public interface LockManagerListener {
     }
 
     /**
-     * After the unlock, also a failed one, which leaves the key busy on this instance until the connection reset.
+     * After the lock was released: unlocked, a failed unlock repeated until then, or gone with its lock connection.
      */
     default void onReleased(LockHandle handle, Duration heldDuration) {
     }

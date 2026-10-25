@@ -11,8 +11,9 @@ import java.util.function.Function;
 public interface LockManager {
 
     /**
-     * Locks {@code key} without waiting, runs {@code work} and unlocks. Empty when the work completes empty.
-     * {@link LockFailedException}: not locked because of an error, the work did not run. Other errors pass unchanged.
+     * Locks {@code key} without waiting, runs {@code work} and unlocks, completes only after the lock is released. Empty
+     * when the work completes empty. {@link LockFailedException}: not locked because of an error, the work did not run.
+     * Errors of the work pass unchanged.
      */
     <T> Mono<LockOutcome<T>> tryWithLock(
             String key, Function<LockHandle, Mono<T>> work

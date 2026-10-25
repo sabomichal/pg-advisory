@@ -15,8 +15,8 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
- * One lock connection with its queue and heartbeat. A broken one is reset: it ends together with the operations still
- * queued on it, and the lock manager replaces it with a new session.
+ * One lock connection with its queue and heartbeat. A broken session ends with the operations queued on it, and the lock
+ * manager replaces it.
  */
 final class LockSession {
 
@@ -30,7 +30,7 @@ final class LockSession {
     private final Disposable heartbeat;
 
     /**
-     * @param onReset called once when the session is found broken, after its connection was closed
+     * @param onReset called once when found broken, after the connection was closed
      */
     LockSession(ConnectionFactory lockConnectionFactory, AdvisoryLockDao dao, LockManagerSettings settings, Runnable onReset) {
         this.connectionFactory = new SingleConnectionFactory(
@@ -42,10 +42,9 @@ final class LockSession {
     }
 
     /**
-     * Runs {@code task} after the tasks submitted before it, regardless of caller cancellation. The task gets the lock
-     * connection, which fails with {@link SessionFinishedException} once the session ended, so that no task reaches a connection
-     * after it. A task submitted after the end runs at once, without waiting in the queue. Errors must be handled within
-     * the task when they matter also to a caller that cancelled.
+     * Runs {@code task} in submission order, also when the caller cancels. Its connection fails with
+     * {@link SessionFinishedException} once the session ended, and a task submitted after that runs at once, outside the
+     * queue. Handle errors inside the task when they matter after a cancel.
      */
     <T> Mono<T> execute(Function<Mono<Connection>, Mono<T>> task) {
         return execute(task, _ -> {
@@ -66,33 +65,22 @@ final class LockSession {
      * non-transient error.
      */
     Mono<Void> checkAndResetConnection() {
-        // the reset happens within the task, so that the tasks queued behind it find the session ended
+        // reset within the task, so the tasks queued behind it find the session ended
         return execute(lockConnection -> lockConnection
-                // an unanswered validation counts as broken, it would hold up the queue of the lock connection
+                // an unanswered validation counts as broken, it would block the queue
                 .flatMap(connection -> Mono.from(connection.validate(ValidationDepth.REMOTE))
                         .timeout(settings.heartbeatTimeout(), Mono.just(false)))
                 .flatMap(valid -> valid ? Mono.<Void>empty() : Mono.error(new ConnectionValidationException()))
-                .doOnError(R2dbcNonTransientResourceException.class, _ -> reset())
-                .doOnError(ConnectionValidationException.class, _ -> reset())
+                .doOnError(R2dbcNonTransientResourceException.class, _ -> resetConnection())
+                .doOnError(ConnectionValidationException.class, _ -> resetConnection())
                 .onErrorResume(R2dbcNonTransientResourceException.class, _ -> Mono.empty())
                 .onErrorResume(ConnectionValidationException.class, _ -> Mono.empty())
                 .onErrorResume(SessionFinishedException.class, _ -> Mono.empty()));
     }
 
     /**
-     * Ends the session once: stops the heartbeat and closes the connection, which drops all its locks.
-     */
-    void reset() {
-        if (finished.compareAndSet(false, true)) {
-            heartbeat.dispose();
-            connectionFactory.destroy().subscribe();
-            onReset.run();
-        }
-    }
-
-    /**
-     * Ends the session after the queued tasks, but waits for them only up to the shutdown lock timeout, then closes the
-     * connection anyway. Not a reset, {@code onReset} is not called.
+     * Ends the session after the queued tasks, or after the shutdown lock timeout at the latest. Not a reset,
+     * {@code onReset} is not called.
      */
     Mono<Void> close() {
         return Mono.defer(() -> {
@@ -110,6 +98,14 @@ final class LockSession {
         return Mono.defer(() -> finished.get() ? Mono.error(new SessionFinishedException()) : connectionFactory.create());
     }
 
+    private void resetConnection() {
+        if (finished.compareAndSet(false, true)) {
+            heartbeat.dispose();
+            connectionFactory.destroy().subscribe();
+            onReset.run();
+        }
+    }
+
     private Mono<Void> destroy() {
         finished.set(true);
         return connectionFactory.destroy();
@@ -124,19 +120,15 @@ final class LockSession {
                 .subscribe();
     }
 
-    /**
-     * The session ended before the task got the lock connection, after a reset or close.
-     */
     static final class SessionFinishedException extends RuntimeException {
-
         SessionFinishedException() {
             super("The lock session ended before the operation ran");
         }
     }
 
-    /**
-     * The lock connection failed its validation.
-     */
     private static class ConnectionValidationException extends RuntimeException {
+        ConnectionValidationException() {
+            super("The lock connection failed its validation");
+        }
     }
 }

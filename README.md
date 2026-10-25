@@ -101,8 +101,11 @@ In a Spring application without Boot, return it from a `@Bean` method; Spring cl
   one; the work did not run and the callbacks were not called.
 
 It fails with `LockFailedException` when the key could not be locked because of an error, e.g. the
-database is unreachable or the lock manager is closed; the work did not run then either. Errors of
-the work and of the unlock are propagated unchanged.
+database is unreachable, the lock manager is closed, or the fencing token could not be issued (the
+lock is released before); the work did not run then either. Errors of
+the work are propagated unchanged. A failed unlock does not fail it: the unlock is repeated with a
+backoff from `unlock-retry-min-backoff` up to `unlock-retry-max-backoff` until it succeeds or the lock
+connection is re-created, and `tryWithLock` completes only then.
 
 The work and the callbacks get a `LockManager.LockHandle` with the key and the fencing token of the lock. The handle is also in
 the Reactor context of the work, so code deep inside it finds the lock with `LockHandle.current()`.
@@ -111,17 +114,37 @@ the Reactor context of the work, so code deep inside it finds the lock with `Loc
 
 A lock does not guarantee that its holder still has it when a write arrives. When the lock connection
 dies, PostgreSQL releases the lock, another instance takes the key over, and a write of the old holder
-may land after the writes of the new one. `LockHandle.fencingToken()` grows with every lock of the key,
-by any instance. Pass it along with the writes, so that their target remembers the highest token and
-rejects older ones:
+may land after the writes of the new one. The old holder does not know yet that its lock is gone, and
+`onConnectionReset` may come after its last check. So the library issues a token, and the target of a
+write checks it.
+
+`LockHandle.fencingToken()` grows with every lock of the key, by any instance. Pass it along with the
+writes, so that their target remembers the highest token and rejects older ones, in the same statement
+as the write:
 
 ```sql
 UPDATE job SET result = :result, fencing_token = :token
 WHERE id = :id AND fencing_token <= :token   -- 0 rows: a newer holder of the key has written already
 ```
 
-Compare only tokens of the same key. The token does not prove that the lock is still held, it lets the
-target of a write reject an older holder.
+- **Check and write at once.** A check before the write does not suffice, a newer holder can write in
+  between. Equal tokens pass, the same holder may write more than once.
+- **Register the token before reading.** The target rejects the old holder only after it accepted a
+  newer token, taking the lock alone does not stop the old holder. A holds the key with token 7 and
+  stalls, its lock connection dies, B takes the key over with token 8 and reads the job. When A wakes
+  up, its write with token 7 still lands, and B works on a state that is gone. B registers its token
+  first, then A's write finds 8 and changes nothing:
+  ```sql
+  UPDATE job SET fencing_token = :token
+  WHERE id = :id AND fencing_token <= :token   -- 0 rows: a newer holder of the key has registered already
+  ```
+- **Compare tokens of one key only.** Tokens of different keys, or of the same key in another lock
+  table, are unrelated. A token grows only while the key's row in the lock table lives: deleting it, or
+  the table, starts the key at 0 again, and a target that remembers a higher token then rejects every
+  new holder. Keep the rows.
+
+The token does not prove that the lock is still held, it lets the target of a write reject an older
+holder.
 
 ## Observability
 
@@ -132,7 +155,7 @@ A `LockManagerListener` gets a callback for every lock attempt and every release
 | `onLocked`          | The key was locked, right before the work starts.                                        |
 | `onBusy`            | The key was busy, with the `Busy` outcome.                                               |
 | `onLockFailed`      | Locking failed with `LockFailedException`.                                               |
-| `onReleased`        | After the unlock, also a failed one. Every `onLocked` is followed by exactly one.        |
+| `onReleased`        | After the lock was released, a failed unlock is repeated until then. Every `onLocked` is followed by exactly one. |
 | `onConnectionReset` | The lock connection was found broken and re-created. Its locks are gone, so work running under them should stop. |
 
 The lock callbacks get the time it took to lock, including the wait for the lock connection, and
@@ -171,6 +194,8 @@ All under `pg-advisory`.
 | `shutdown-lock-timeout`                 | `30s`                | How long closing waits for the queued operations, then it closes anyway.  |
 | `heartbeat-interval`                    | `1s`                 | How often the lock connection is validated, a broken one is re-created.   |
 | `heartbeat-timeout`                     | `5s`                 | How long a validation may take, then the connection counts as broken.     |
+| `unlock-retry-min-backoff`              | `100ms`              | First delay before a failed unlock is repeated.                           |
+| `unlock-retry-max-backoff`              | `5s`                 | Longest delay between the repeats of a failed unlock.                     |
 | `r2dbc.url` / `username` / `password`   | *(`spring.r2dbc.*`)* | Dedicated, unpooled lock connection.                                      |
 
 ## How it works
@@ -189,8 +214,9 @@ All under `pg-advisory`.
    `fencing_token` is `LockHandle.fencingToken()`: higher than the token of every earlier lock of the
    key, by any instance. When it cannot be issued, the key is unlocked again.
 
-Then `work` runs, and the lock is released with `pg_advisory_unlock`. The lock connection serves
-one operation at a time, the others wait in a FIFO queue.
+Then `work` runs, and the lock is released with `pg_advisory_unlock`. A failed unlock is repeated
+with a backoff, each time at the end of the queue, so that other locks go on, and the key stays busy
+until it succeeds. The lock connection serves one operation at a time, the others wait in a FIFO queue.
 
 A heartbeat validates the lock connection every `heartbeat-interval`, through the same queue. A
 validation that does not answer within `heartbeat-timeout` counts as broken. A broken connection is
@@ -200,10 +226,11 @@ nothing left to release.
 
 ## Limitations
 
-- **No fencing.** When the lock connection dies, PostgreSQL releases its locks and another instance
-  can take over, while work of this instance may still be running and committing. The heartbeat
-  notices it within `heartbeat-interval` and calls `LockManagerListener.onConnectionReset`, the work
-  itself is not told. The fencing token is there, but nothing checks it before a commit yet.
+- **Fencing is up to the application.** When the lock connection dies, PostgreSQL releases its locks
+  and another instance can take over, while work of this instance may still be running and committing.
+  The heartbeat notices it within `heartbeat-interval` and calls `LockManagerListener.onConnectionReset`,
+  the work itself is not told. The library issues the fencing token, the target of a write has to check
+  it, see [Fencing token](#fencing-token).
 - Known weaknesses of the current implementation, e.g. a reset lets this instance lock a key again
   while the old work under it still runs, and how they are going to be fixed step by step: see
   [ROADMAP.md](ROADMAP.md).

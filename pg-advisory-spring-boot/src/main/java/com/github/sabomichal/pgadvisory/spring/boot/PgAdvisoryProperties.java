@@ -10,15 +10,17 @@ import java.time.Duration;
 /**
  * Configuration of pg-advisory. The defaults are the same as {@link LockManagerSettings#defaults()}.
  *
- * @param enabled             Whether to enable the auto-configuration.
- * @param tableName           Lock table, optionally schema qualified.
- * @param applicationName     application_name of the lock connection, visible in pg_stat_activity.
- * @param shutdownLockTimeout How long closing the lock manager waits for the queued operations, then it closes the
- *                            lock connection anyway.
- * @param heartbeatInterval   How often the lock connection is validated, a broken one is re-created.
- * @param heartbeatTimeout    How long a validation of the lock connection may take, then it counts as broken.
- * @param schema              Lock table schema.
- * @param r2dbc               Dedicated connection of the lock manager.
+ * @param enabled               Whether to enable the auto-configuration.
+ * @param tableName             Lock table, optionally schema qualified.
+ * @param applicationName       application_name of the lock connection, visible in pg_stat_activity.
+ * @param shutdownLockTimeout   How long closing the lock manager waits for the queued operations, then it closes the
+ *                              lock connection anyway.
+ * @param heartbeatInterval     How often the lock connection is validated, a broken one is re-created.
+ * @param heartbeatTimeout      How long a validation of the lock connection may take, then it counts as broken.
+ * @param unlockRetryMinBackoff First delay before a failed unlock is repeated.
+ * @param unlockRetryMaxBackoff Longest delay between the repeats of a failed unlock.
+ * @param schema                Lock table schema.
+ * @param r2dbc                 Dedicated connection of the lock manager.
  */
 @ConfigurationProperties("pg-advisory")
 public record PgAdvisoryProperties(
@@ -28,6 +30,8 @@ public record PgAdvisoryProperties(
         @DefaultValue("30s") Duration shutdownLockTimeout,
         @DefaultValue("1s") Duration heartbeatInterval,
         @DefaultValue("5s") Duration heartbeatTimeout,
+        @DefaultValue("100ms") Duration unlockRetryMinBackoff,
+        @DefaultValue("5s") Duration unlockRetryMaxBackoff,
         @DefaultValue Schema schema,
         @DefaultValue R2dbc r2dbc) {
 
@@ -60,6 +64,8 @@ public record PgAdvisoryProperties(
                 .shutdownLockTimeout(shutdownLockTimeout)
                 .heartbeatInterval(heartbeatInterval)
                 .heartbeatTimeout(heartbeatTimeout)
+                .unlockRetryMinBackoff(unlockRetryMinBackoff)
+                .unlockRetryMaxBackoff(unlockRetryMaxBackoff)
                 .build();
     }
 }
